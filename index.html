@@ -1,5 +1,8 @@
 <!--
-  PROJECT ZERO — v1.0 (2026-09-06)
+  PROJECT ZERO — v1.0.1 (2026-09-06)
+  v1.0.1 fix: supabase-js was loaded from a cdnjs path that does not exist, so the
+  global was never defined and the whole app failed on init. Now loaded from jsDelivr
+  (same source PM-OS uses). No functional change beyond making the page actually run.
   Sudharsan's personal job-application tracker.
   Backed by its own isolated Supabase project (bxzmneeacjjtwmtdsrjd) — separate from PM-OS.
   Login-gated (Supabase Auth), RLS locked to `authenticated` on every table from v1.0.
@@ -239,7 +242,7 @@
     </div>
   </div>
 </div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/supabase/2.45.4/supabase.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 const SUPABASE_URL='https://bxzmneeacjjtwmtdsrjd.supabase.co';
 const SUPABASE_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJ4em1uZWVhY2pqdHdtdGRzcmpkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg2ODA0NjcsImV4cCI6MjEwNDI1NjQ2N30.YRr8htwXZ-9qKpOC8A2ZYs-gCsxKmgbkQvuMtqiqwUM';
