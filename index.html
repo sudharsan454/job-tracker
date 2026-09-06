@@ -1,28 +1,36 @@
 <!--
-  PROJECT ZERO — v1.0.1 (2026-09-06)
-  v1.0.1 fix: supabase-js was loaded from a cdnjs path that does not exist, so the
-  global was never defined and the whole app failed on init. Now loaded from jsDelivr
-  (same source PM-OS uses). No functional change beyond making the page actually run.
+  PROJECT ZERO — v1.1 (2026-09-06)
   Sudharsan's personal job-application tracker.
   Backed by its own isolated Supabase project (bxzmneeacjjtwmtdsrjd) — separate from PM-OS.
-  Login-gated (Supabase Auth), RLS locked to `authenticated` on every table from v1.0.
-
-  What's in v1.0:
-  - Leads (manual add for now — email-alert ingestion is Phase 2, pending Gmail connector authorization)
-  - Dedup check on promote: fuzzy match (normalized company+title+location) against existing Applications
-    and other open Leads before a Lead becomes an Application
-  - Applications: status (applied/screening/interview/offer/rejected/withdrawn), notes
-  - Contacts: ONE shared table for HR + Consultant people, linked many-to-many to Applications
-  - Interviews: multiple rounds per Application (interviewer, LinkedIn, date, stage, document upload
-    to private Supabase Storage bucket 'interview-transcripts')
-
-  NOT in v1.0 (explicitly deferred, see discovery-impact-triage handoff packet):
-  - Automated email-alert ingestion (blocked on Gmail connector authorization — Phase 2)
-  - Google Calendar sync (no connector available — this app's own upcoming-interviews view stands in)
-  - Audio-recording transcription (assumed document/notes upload, not recordings)
+  Login-gated (Supabase Auth), RLS locked to `authenticated` on every table.
 
   CHANGELOG
-  - v1.0 (2026-09-06): initial build — core schema, login, Leads/Applications/Contacts/Interviews CRUD, dedup-on-promote.
+  - v1.0   (2026-09-06): initial build — core schema, login, Leads/Applications/Contacts/Interviews
+                         CRUD, dedup-on-promote.
+  - v1.0.1 (2026-09-06): fix — supabase-js was loaded from a cdnjs path that does not exist, so the
+                         global was never defined and the app died on init. Now on jsDelivr.
+  - v1.1   (2026-09-06): Job Boards lookup (replaces hardcoded platform list). Consultant
+                         Organisations lookup. Noise-marking with a mandatory reason (reasons are a
+                         reusable lookup). Hard delete on Leads and Applications. Filter Criteria
+                         panel with auto-triage on lead creation. "Referral Pending" status.
+                         Interview Notes field (the column existed since v1.0 but had no input).
+                         Transcript text extraction from uploaded documents. Resume-fit rubric,
+                         score, and tailored-resume upload.
+
+  HOW TRIAGE WORKS (deliberately not an AI judgment call):
+    Every new Lead is checked against the Filter Criteria you maintain in the Setup tab.
+      - title_exclude  : if the job title contains the phrase, the lead is auto-marked noise.
+                         Short tokens (<=3 chars, e.g. "VP", "FSO") match on word boundary only,
+                         so "VPN Engineer" does not trip the "VP" rule.
+      - location_allow : the location must match at least one allowed value, otherwise auto-noise.
+                         A blank location is never auto-excluded, since it can't be judged.
+    Whatever fires is written to leads.matched_criterion, so you can always see why something was
+    filtered rather than guessing. Nothing is deleted by triage — noise stays visible and reversible.
+
+  NOT IN v1.1 (still deferred):
+  - Gmail job-alert ingestion and rejection-email auto-detect (blocked on Gmail connector authorization)
+  - Google Calendar sync (no connector available)
+  - Automated AI resume generation (no in-app LLM layer; the app stores the score and the file you upload)
 -->
 <!DOCTYPE html>
 <html lang="en">
@@ -51,20 +59,22 @@
   header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
   header h1{font-size:22px;margin:0}
   header .ver{color:var(--muted);font-size:12px}
-  nav{display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid var(--border)}
+  nav{display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid var(--border);flex-wrap:wrap}
   nav button{background:none;border:none;color:var(--muted);padding:10px 16px;cursor:pointer;font-size:14px;border-bottom:2px solid transparent}
   nav button.active{color:var(--text);border-bottom-color:var(--accent)}
 
   .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px}
-  .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .panel h3.panel-title{margin:0 0 12px;font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;align-items:center}
   .row input,.row select,.row textarea{background:var(--panel2);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px 10px;font-size:13px}
   .row input,.row select{flex:1;min-width:120px}
-  textarea{width:100%;min-height:50px;resize:vertical}
+  textarea{width:100%;min-height:50px;resize:vertical;background:var(--panel2);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px 10px;font-size:13px;font-family:inherit}
   button.btn{background:var(--accent);border:none;color:#fff;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600}
   button.btn:hover{background:var(--accent2)}
   button.btn.secondary{background:var(--panel2);border:1px solid var(--border);color:var(--text)}
   button.btn.small{padding:4px 10px;font-size:12px}
   button.btn.danger{background:var(--bad)}
+  button.btn.danger:hover{background:#DC2626}
 
   table{width:100%;border-collapse:collapse;font-size:13px}
   th{text-align:left;color:var(--muted);font-weight:600;padding:8px;border-bottom:1px solid var(--border);font-size:12px;text-transform:uppercase}
@@ -74,26 +84,40 @@
   .badge.new{background:#334155;color:var(--muted)}
   .badge.promoted{background:#14532D;color:var(--good)}
   .badge.dismissed{background:#450A0A;color:var(--bad)}
+  .badge.noise{background:#431407;color:#FB923C}
   .badge.applied{background:#1E3A5F;color:#60A5FA}
+  .badge.referral_pending{background:#422006;color:var(--warn)}
   .badge.screening{background:#422006;color:var(--warn)}
   .badge.interview{background:#3B0764;color:#C084FC}
   .badge.offer{background:#14532D;color:var(--good)}
   .badge.rejected{background:#450A0A;color:var(--bad)}
   .badge.withdrawn{background:#334155;color:var(--muted)}
+  .badge.hr{background:#1E3A5F;color:#60A5FA}
+  .badge.consultant{background:#3B0764;color:#C084FC}
 
   .empty{color:var(--muted);text-align:center;padding:30px;font-size:13px}
   .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;align-items:center;justify-content:center}
-  .modal{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:20px;width:520px;max-height:85vh;overflow-y:auto}
+  .modal{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:20px;width:560px;max-height:85vh;overflow-y:auto}
   .modal h2{margin:0 0 14px;font-size:16px}
   .modal-close{float:right;background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px}
   .field-label{font-size:12px;color:var(--muted);margin:10px 0 4px;display:block}
   .subsection{border-top:1px solid var(--border);margin-top:14px;padding-top:14px}
   .subsection h3{font-size:13px;margin:0 0 8px;color:var(--muted);text-transform:uppercase}
   .interview-round{background:var(--panel2);border-radius:8px;padding:10px;margin-bottom:8px;font-size:12px}
-  .dup-match{background:#422006;border:1px solid var(--warn);border-radius:8px;padding:10px;margin-bottom:8px;font-size:12px}
   .muted{color:var(--muted)}
   .link{color:var(--accent2);text-decoration:none;cursor:pointer}
   .link:hover{text-decoration:underline}
+  .chip{display:inline-flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--border);border-radius:14px;padding:4px 10px;font-size:12px;margin:0 6px 6px 0}
+  .chip.inactive{opacity:.45}
+  .chip button{background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0}
+  .rubric-row{display:flex;align-items:center;gap:10px;margin-bottom:6px;font-size:12px}
+  .rubric-row label{flex:1;color:var(--muted)}
+  .rubric-row select{width:70px;background:var(--panel2);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:4px 6px;font-size:12px}
+  .rubric-row .wt{width:44px;text-align:right;color:var(--muted);font-size:11px}
+  .score-box{background:var(--panel2);border-radius:8px;padding:10px;margin-top:8px;font-size:13px}
+  .score-val{font-size:20px;font-weight:700}
+  .setup-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:760px){.setup-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -112,13 +136,14 @@
 <div id="app">
   <header>
     <h1>Project Zero</h1>
-    <span class="ver">v1.0</span>
+    <span class="ver">v1.1</span>
   </header>
 
   <nav>
     <button class="tab-btn active" data-tab="leads" onclick="switchTab('leads')">Leads</button>
     <button class="tab-btn" data-tab="applications" onclick="switchTab('applications')">Applications</button>
     <button class="tab-btn" data-tab="contacts" onclick="switchTab('contacts')">Contacts</button>
+    <button class="tab-btn" data-tab="setup" onclick="switchTab('setup')">Setup</button>
   </nav>
 
   <!-- LEADS TAB -->
@@ -130,23 +155,21 @@
         <input id="lead-location" placeholder="Location">
       </div>
       <div class="row">
-        <select id="lead-platform">
-          <option value="manual">Manual</option>
-          <option value="linkedin">LinkedIn</option>
-          <option value="indeed">Indeed</option>
-          <option value="glassdoor">Glassdoor</option>
-          <option value="naukri">Naukri</option>
-        </select>
+        <select id="lead-board"></select>
         <input id="lead-url" placeholder="Job posting URL">
         <button class="btn" onclick="addLead()">+ Add Lead</button>
       </div>
+      <div class="muted" style="font-size:12px">New leads are auto-checked against your Filter Criteria (Setup tab). Anything excluded is marked noise with the reason recorded, never silently dropped.</div>
     </div>
     <div class="panel">
+      <div class="row">
+        <label class="muted" style="font-size:12px"><input type="checkbox" id="show-noise" onchange="renderLeads()"> Show noise / dismissed</label>
+      </div>
       <table>
-        <thead><tr><th>Title</th><th>Company</th><th>Location</th><th>Platform</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Title</th><th>Company</th><th>Location</th><th>Board</th><th>Status</th><th>Why filtered</th><th></th></tr></thead>
         <tbody id="leads-table"></tbody>
       </table>
-      <div id="leads-empty" class="empty" style="display:none">No leads yet. Add one above, or once Gmail ingestion is wired up (Phase 2), they'll appear here automatically.</div>
+      <div id="leads-empty" class="empty" style="display:none">No leads yet. Add one above, or once Gmail ingestion is wired up, they'll appear here automatically.</div>
     </div>
   </div>
 
@@ -159,11 +182,11 @@
         <input id="app-location" placeholder="Location">
         <button class="btn" onclick="addApplicationDirect()">+ Add Application</button>
       </div>
-      <div class="muted" style="font-size:12px">Applications are usually created by promoting a Lead (Leads tab) — this is for adding one directly if you already applied outside the tracker.</div>
+      <div class="muted" style="font-size:12px">Applications are usually created by promoting a Lead. This is for one you applied to outside the tracker.</div>
     </div>
     <div class="panel">
       <table>
-        <thead><tr><th>Title</th><th>Company</th><th>Status</th><th>Applied</th><th>Contacts</th><th>Interviews</th><th></th></tr></thead>
+        <thead><tr><th>Title</th><th>Company</th><th>Status</th><th>Fit</th><th>Applied</th><th>Contacts</th><th>Rounds</th><th></th></tr></thead>
         <tbody id="applications-table"></tbody>
       </table>
       <div id="applications-empty" class="empty" style="display:none">No applications yet.</div>
@@ -175,11 +198,12 @@
     <div class="panel">
       <div class="row">
         <input id="contact-name" placeholder="Name">
-        <select id="contact-type">
+        <select id="contact-type" onchange="toggleConsultantOrg()">
           <option value="hr">HR</option>
           <option value="consultant">Consultant</option>
         </select>
-        <input id="contact-org" placeholder="Organization">
+        <input id="contact-org" placeholder="Organization (company)">
+        <select id="contact-consultant-org" style="display:none"></select>
       </div>
       <div class="row">
         <input id="contact-phone" placeholder="Phone">
@@ -190,10 +214,57 @@
     </div>
     <div class="panel">
       <table>
-        <thead><tr><th>Name</th><th>Type</th><th>Organization</th><th>Phone</th><th>Email</th><th>LinkedIn</th></tr></thead>
+        <thead><tr><th>Name</th><th>Type</th><th>Organization</th><th>Phone</th><th>Email</th><th>LinkedIn</th><th></th></tr></thead>
         <tbody id="contacts-table"></tbody>
       </table>
       <div id="contacts-empty" class="empty" style="display:none">No contacts yet.</div>
+    </div>
+  </div>
+
+  <!-- SETUP TAB -->
+  <div id="tab-setup" class="tab-content" style="display:none">
+    <div class="panel">
+      <h3 class="panel-title">Filter Criteria — how leads get triaged</h3>
+      <div class="row">
+        <select id="fc-type" style="max-width:190px">
+          <option value="title_exclude">Exclude job title containing</option>
+          <option value="location_allow">Allow location containing</option>
+        </select>
+        <input id="fc-value" placeholder="e.g. Associate Product Manager">
+        <button class="btn" onclick="addCriterion()">+ Add</button>
+      </div>
+      <div style="margin-top:12px">
+        <div class="muted" style="font-size:12px;margin-bottom:6px">Title excludes (a lead whose title contains any of these is auto-noise):</div>
+        <div id="fc-title-list"></div>
+        <div class="muted" style="font-size:12px;margin:12px 0 6px">Allowed locations (a lead must match at least one of these, unless its location is blank):</div>
+        <div id="fc-location-list"></div>
+      </div>
+    </div>
+
+    <div class="setup-grid">
+      <div class="panel">
+        <h3 class="panel-title">Job Boards</h3>
+        <div class="row">
+          <input id="jb-name" placeholder="Board name">
+          <button class="btn small" onclick="addJobBoard()">+ Add</button>
+        </div>
+        <div id="jb-list"></div>
+      </div>
+
+      <div class="panel">
+        <h3 class="panel-title">Consultant Organisations</h3>
+        <div class="row">
+          <input id="co-name" placeholder="Consultancy name">
+          <button class="btn small" onclick="addConsultantOrg()">+ Add</button>
+        </div>
+        <div id="co-list"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3 class="panel-title">Noise Reasons (reusable)</h3>
+      <div id="nr-list"></div>
+      <div class="muted" style="font-size:12px;margin-top:8px">These build up automatically as you mark things noise. Reused across leads and applications.</div>
     </div>
   </div>
 </div>
@@ -201,10 +272,11 @@
 <!-- Application detail modal -->
 <div class="modal-overlay" id="app-modal-overlay">
   <div class="modal">
-    <button class="modal-close" onclick="closeAppModal()">×</button>
+    <button class="modal-close" onclick="closeAppModal()">&times;</button>
     <h2 id="app-modal-title">Application</h2>
     <label class="field-label">Status</label>
     <select id="app-modal-status" style="width:100%" onchange="saveAppField('status', this.value)">
+      <option value="referral_pending">Referral Pending — decided to apply, waiting on a referral</option>
       <option value="applied">Applied</option>
       <option value="screening">Screening</option>
       <option value="interview">Interview</option>
@@ -214,6 +286,28 @@
     </select>
     <label class="field-label">Notes</label>
     <textarea id="app-modal-notes" onblur="saveAppField('notes', this.value)"></textarea>
+
+    <div class="subsection">
+      <h3>Resume fit</h3>
+      <div id="rubric-container"></div>
+      <div class="score-box">
+        <span class="score-val" id="fit-score-display">—</span>
+        <span class="muted"> / 5 weighted</span>
+        <div style="margin-top:6px">
+          <label style="font-size:12px"><input type="checkbox" id="needs-resume-cb" onchange="saveResumeFlag()"> Tailored resume needed</label>
+          <span class="muted" style="font-size:11px"> (auto-ticks at 3.5+, you can override)</span>
+        </div>
+        <button class="btn small" style="margin-top:8px" onclick="saveFitScore()">Save score</button>
+      </div>
+      <label class="field-label">Tailored resume file</label>
+      <div class="row">
+        <input type="file" id="resume-file" style="flex:1;font-size:12px">
+        <button class="btn small" onclick="uploadResume()">Upload</button>
+      </div>
+      <div id="resume-current" class="muted" style="font-size:12px"></div>
+      <label class="field-label">Resume notes</label>
+      <textarea id="app-modal-resume-notes" onblur="saveAppField('resume_notes', this.value)"></textarea>
+    </div>
 
     <div class="subsection">
       <h3>Contacts</h3>
@@ -235,13 +329,18 @@
         <input id="new-round-linkedin" placeholder="Interviewer LinkedIn URL">
         <input id="new-round-date" type="date">
       </div>
+      <label class="field-label">Your notes (what you learned — separate from the transcript)</label>
+      <textarea id="new-round-notes" placeholder="What you took away from this round"></textarea>
+      <label class="field-label">Transcript document (txt, md, pdf, docx — text is extracted automatically)</label>
       <div class="row">
         <input type="file" id="new-round-file" style="flex:1;font-size:12px">
         <button class="btn small" onclick="addInterviewRound()">+ Add Round</button>
       </div>
+      <div id="round-status" class="muted" style="font-size:12px"></div>
     </div>
   </div>
 </div>
+
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 const SUPABASE_URL='https://bxzmneeacjjtwmtdsrjd.supabase.co';
@@ -249,7 +348,19 @@ const SUPABASE_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSI
 const sb=supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
 
 let leadsData=[], applicationsData=[], contactsData=[], appContactsData=[], interviewsData=[];
+let jobBoardsData=[], consultantOrgsData=[], noiseReasonsData=[], filterCriteriaData=[];
 let currentAppId=null;
+
+// Rubric: dimension key, label, weight. Weights sum to 1.0.
+const RUBRIC=[
+  {k:'title',   label:'Title / seniority match',              w:0.25},
+  {k:'domain',  label:'Domain overlap (SaaS / PropTech / AI)', w:0.20},
+  {k:'referral',label:'Referral or warm intro available',      w:0.15},
+  {k:'company', label:'Company stage / funding health',        w:0.15},
+  {k:'comp',    label:'Compensation signal',                   w:0.15},
+  {k:'location',label:'Location / work-mode fit',              w:0.10}
+];
+const FIT_THRESHOLD=3.5;
 
 // ---------- AUTH ----------
 async function doLogin(){
@@ -260,9 +371,7 @@ async function doLogin(){
     const el=document.getElementById('login-error');
     el.textContent=error.message;
     el.style.display='block';
-  } else {
-    showApp();
-  }
+  } else { showApp(); }
 }
 function showApp(){
   document.getElementById('login-screen').style.display='none';
@@ -284,7 +393,6 @@ function switchTab(tab){
 
 // ---------- FUZZY DEDUP ----------
 function normalize(s){ return (s||'').toLowerCase().replace(/[^a-z0-9 ]/g,'').replace(/\s+/g,' ').trim(); }
-// simple bigram Dice coefficient similarity, 0..1
 function similarity(a,b){
   a=normalize(a); b=normalize(b);
   if(!a||!b) return 0;
@@ -297,10 +405,7 @@ function similarity(a,b){
   return (2*matches)/(ba.length+bb.length);
 }
 function jobSimilarity(a,b){
-  const cSim=similarity(a.company,b.company);
-  const tSim=similarity(a.title,b.title);
-  const lSim=similarity(a.location,b.location);
-  return cSim*0.45 + tSim*0.4 + lSim*0.15;
+  return similarity(a.company,b.company)*0.45 + similarity(a.title,b.title)*0.4 + similarity(a.location,b.location)*0.15;
 }
 function findDuplicates(candidate, excludeId){
   const DUP_THRESHOLD=0.72;
@@ -317,56 +422,159 @@ function findDuplicates(candidate, excludeId){
   return matches.sort((a,b)=>b.sim-a.sim);
 }
 
+// ---------- TRIAGE ----------
+function escapeRegex(s){ return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }
+function evaluateLead(lead){
+  const active=filterCriteriaData.filter(f=>f.is_active);
+  const titleRaw=lead.title||'';
+  const title=titleRaw.toLowerCase();
+  for(const c of active.filter(f=>f.criterion_type==='title_exclude')){
+    const v=(c.value||'').trim();
+    if(!v) continue;
+    let hit;
+    if(v.length<=3){ hit=new RegExp('\\b'+escapeRegex(v)+'\\b','i').test(titleRaw); }
+    else { hit=title.includes(v.toLowerCase()); }
+    if(hit) return {excluded:true, reason:'Excluded title term: '+v, criterion:'title_exclude: '+v};
+  }
+  const allows=active.filter(f=>f.criterion_type==='location_allow');
+  const loc=(lead.location||'').trim();
+  if(allows.length && loc){
+    const ok=allows.some(c=>loc.toLowerCase().includes((c.value||'').trim().toLowerCase()));
+    if(!ok) return {excluded:true, reason:'Location outside allowed list: '+loc, criterion:'location_allow: no match for "'+loc+'"'};
+  }
+  return {excluded:false};
+}
+
+// ---------- NOISE REASONS ----------
+async function ensureNoiseReason(text){
+  const t=(text||'').trim();
+  if(!t) return null;
+  const existing=noiseReasonsData.find(r=>(r.reason||'').toLowerCase()===t.toLowerCase());
+  if(existing) return existing.id;
+  const {data,error}=await sb.from('noise_reasons').insert({reason:t}).select().single();
+  if(error){ alert('Could not save reason: '+error.message); return null; }
+  noiseReasonsData.push(data);
+  return data.id;
+}
+
 // ---------- DATA LOAD ----------
 async function loadAll(){
-  const [l,a,c,ac,iv]=await Promise.all([
+  const [l,a,c,ac,iv,jb,co,nr,fc]=await Promise.all([
     sb.from('leads').select('*').order('created_at',{ascending:false}),
     sb.from('applications').select('*').order('created_at',{ascending:false}),
     sb.from('contacts').select('*').order('name'),
     sb.from('application_contacts').select('*'),
-    sb.from('interviews').select('*').order('round_number')
+    sb.from('interviews').select('*').order('round_number'),
+    sb.from('job_boards').select('*').order('name'),
+    sb.from('consultant_organizations').select('*').order('name'),
+    sb.from('noise_reasons').select('*').order('created_at'),
+    sb.from('filter_criteria').select('*').order('created_at')
   ]);
   leadsData=l.data||[]; applicationsData=a.data||[]; contactsData=c.data||[];
   appContactsData=ac.data||[]; interviewsData=iv.data||[];
-  renderLeads(); renderApplications(); renderContacts();
+  jobBoardsData=jb.data||[]; consultantOrgsData=co.data||[];
+  noiseReasonsData=nr.data||[]; filterCriteriaData=fc.data||[];
+  populateBoardSelect(); populateConsultantOrgSelect();
+  renderLeads(); renderApplications(); renderContacts(); renderSetup();
 }
+
+// ---------- LOOKUP SELECTS ----------
+function populateBoardSelect(){
+  const sel=document.getElementById('lead-board');
+  const prev=sel.value;
+  sel.innerHTML='<option value="">— Job board —</option>'+
+    jobBoardsData.filter(b=>b.is_active).map(b=>`<option value="${b.id}">${esc(b.name)}</option>`).join('');
+  if(prev) sel.value=prev;
+}
+function populateConsultantOrgSelect(){
+  const sel=document.getElementById('contact-consultant-org');
+  sel.innerHTML='<option value="">— Consultancy —</option>'+
+    consultantOrgsData.map(o=>`<option value="${o.id}">${esc(o.name)}</option>`).join('');
+}
+function toggleConsultantOrg(){
+  const isConsultant=document.getElementById('contact-type').value==='consultant';
+  document.getElementById('contact-consultant-org').style.display=isConsultant?'':'none';
+  document.getElementById('contact-org').style.display=isConsultant?'none':'';
+}
+function boardName(id){ const b=jobBoardsData.find(x=>x.id===id); return b?b.name:null; }
 
 // ---------- LEADS ----------
 async function addLead(){
   const title=document.getElementById('lead-title').value.trim();
   const company=document.getElementById('lead-company').value.trim();
   const location=document.getElementById('lead-location').value.trim();
-  const platform=document.getElementById('lead-platform').value;
+  const job_board_id=document.getElementById('lead-board').value||null;
   const url=document.getElementById('lead-url').value.trim();
   if(!title||!company){ alert('Title and company are required.'); return; }
+
+  const verdict=evaluateLead({title,company,location});
+  let status='new', noise_reason_id=null, matched_criterion=null;
+  if(verdict.excluded){
+    status='noise';
+    matched_criterion=verdict.criterion;
+    noise_reason_id=await ensureNoiseReason(verdict.reason);
+  }
   const dedup_key=normalize(company)+'|'+normalize(title)+'|'+normalize(location);
-  const {error}=await sb.from('leads').insert({title,company,location,source_platform:platform,url,dedup_key});
+  const {error}=await sb.from('leads').insert({
+    title,company,location,url,dedup_key,job_board_id,
+    source_platform:boardName(job_board_id)||'manual',
+    status,noise_reason_id,matched_criterion
+  });
   if(error){ alert('Save failed: '+error.message); return; }
-  document.getElementById('lead-title').value='';
-  document.getElementById('lead-company').value='';
-  document.getElementById('lead-location').value='';
-  document.getElementById('lead-url').value='';
+  ['lead-title','lead-company','lead-location','lead-url'].forEach(id=>document.getElementById(id).value='');
   await loadAll();
+  if(verdict.excluded){
+    document.getElementById('show-noise').checked=true;
+    renderLeads();
+    alert('Added, but auto-marked noise.\n\n'+verdict.reason+'\n\nTick "Show noise" to see it. You can restore it if the rule was wrong.');
+  }
 }
 function renderLeads(){
   const tbody=document.getElementById('leads-table');
-  const visible=leadsData.filter(l=>l.status!=='promoted');
+  const showNoise=document.getElementById('show-noise').checked;
+  const visible=leadsData.filter(l=>{
+    if(l.status==='promoted') return false;
+    if(!showNoise && (l.status==='noise'||l.status==='dismissed')) return false;
+    return true;
+  });
   tbody.innerHTML='';
   document.getElementById('leads-empty').style.display=visible.length?'none':'block';
   for(const l of visible){
     const tr=document.createElement('tr');
+    const isOut=(l.status==='noise'||l.status==='dismissed');
     tr.innerHTML=`<td>${esc(l.title)}</td><td>${esc(l.company)}</td><td>${esc(l.location||'—')}</td>
-      <td>${esc(l.source_platform)}</td>
+      <td>${esc(boardName(l.job_board_id)||l.source_platform||'—')}</td>
       <td><span class="badge ${l.status}">${l.status}</span></td>
-      <td>
-        <button class="btn small" onclick="promoteLead('${l.id}')">Promote</button>
-        <button class="btn small secondary" onclick="dismissLead('${l.id}')">Dismiss</button>
+      <td class="muted" style="font-size:11px">${esc(l.matched_criterion||'—')}</td>
+      <td style="white-space:nowrap">
+        ${isOut
+          ? `<button class="btn small secondary" onclick="restoreLead('${l.id}')">Restore</button>`
+          : `<button class="btn small" onclick="promoteLead('${l.id}')">Promote</button>
+             <button class="btn small secondary" onclick="markLeadNoise('${l.id}')">Noise</button>`}
+        <button class="btn small danger" onclick="deleteLead('${l.id}')">Delete</button>
       </td>`;
     tbody.appendChild(tr);
   }
 }
-async function dismissLead(id){
-  await sb.from('leads').update({status:'dismissed'}).eq('id',id);
+async function markLeadNoise(id){
+  const reason=prompt('Why is this noise? (saved as a reusable reason)');
+  if(reason===null) return;
+  if(!reason.trim()){ alert('A reason is required to mark something noise.'); return; }
+  const rid=await ensureNoiseReason(reason);
+  const {error}=await sb.from('leads').update({status:'noise', noise_reason_id:rid, matched_criterion:'manual: '+reason.trim()}).eq('id',id);
+  if(error){ alert('Failed: '+error.message); return; }
+  await loadAll();
+}
+async function restoreLead(id){
+  const {error}=await sb.from('leads').update({status:'new', noise_reason_id:null, matched_criterion:null}).eq('id',id);
+  if(error){ alert('Failed: '+error.message); return; }
+  await loadAll();
+}
+async function deleteLead(id){
+  const l=leadsData.find(x=>x.id===id);
+  if(!confirm(`Permanently delete this lead?\n\n${l?l.title+' — '+l.company:''}\n\nThis cannot be undone.`)) return;
+  const {error}=await sb.from('leads').delete().eq('id',id);
+  if(error){ alert('Delete failed: '+error.message); return; }
   await loadAll();
 }
 async function promoteLead(id){
@@ -376,13 +584,15 @@ async function promoteLead(id){
   if(dups.length){
     const top=dups[0];
     const pct=Math.round(top.sim*100);
-    const label=top.type==='application' ? `an existing Application (${top.record.company} — ${top.record.title}, status: ${top.record.status})` : `another Lead (${top.record.company} — ${top.record.title})`;
-    const proceed=confirm(`Possible duplicate detected (${pct}% match) against ${label}.\n\nOK = promote anyway as a new Application\nCancel = don't promote`);
-    if(!proceed) return;
+    const label=top.type==='application'
+      ? `an existing Application (${top.record.company} — ${top.record.title}, status: ${top.record.status})`
+      : `another Lead (${top.record.company} — ${top.record.title})`;
+    if(!confirm(`Possible duplicate (${pct}% match) against ${label}.\n\nOK = promote anyway\nCancel = don't promote`)) return;
   }
   const {data,error}=await sb.from('applications').insert({
     lead_id:lead.id, title:lead.title, company:lead.company, location:lead.location,
-    url:lead.url, source_platform:lead.source_platform, status:'applied'
+    url:lead.url, source_platform:lead.source_platform, job_board_id:lead.job_board_id,
+    status:'referral_pending'
   }).select().single();
   if(error){ alert('Promote failed: '+error.message); return; }
   await sb.from('leads').update({status:'promoted', promoted_application_id:data.id}).eq('id',id);
@@ -398,9 +608,7 @@ async function addApplicationDirect(){
   if(!title||!company){ alert('Title and company are required.'); return; }
   const {error}=await sb.from('applications').insert({title,company,location,status:'applied'});
   if(error){ alert('Save failed: '+error.message); return; }
-  document.getElementById('app-title').value='';
-  document.getElementById('app-company').value='';
-  document.getElementById('app-location').value='';
+  ['app-title','app-company','app-location'].forEach(id=>document.getElementById(id).value='');
   await loadAll();
 }
 function renderApplications(){
@@ -410,14 +618,43 @@ function renderApplications(){
   for(const a of applicationsData){
     const contactCount=appContactsData.filter(ac=>ac.application_id===a.id).length;
     const interviewCount=interviewsData.filter(iv=>iv.application_id===a.id).length;
+    const fit=(a.fit_score!==null&&a.fit_score!==undefined)
+      ? `${Number(a.fit_score).toFixed(1)}${a.needs_tailored_resume?' ★':''}` : '—';
     const tr=document.createElement('tr');
     tr.innerHTML=`<td>${esc(a.title)}</td><td>${esc(a.company)}</td>
-      <td><span class="badge ${a.status}">${a.status}</span></td>
+      <td><span class="badge ${a.status}">${a.status.replace('_',' ')}</span></td>
+      <td>${fit}</td>
       <td>${a.applied_date||'—'}</td>
       <td>${contactCount}</td><td>${interviewCount}</td>
-      <td><span class="link" onclick="openAppModal('${a.id}')">Open →</span></td>`;
+      <td style="white-space:nowrap">
+        <span class="link" onclick="openAppModal('${a.id}')">Open</span>
+        <button class="btn small secondary" onclick="markAppNoise('${a.id}')">Noise</button>
+        <button class="btn small danger" onclick="deleteApplication('${a.id}')">Delete</button>
+      </td>`;
     tbody.appendChild(tr);
   }
+}
+async function markAppNoise(id){
+  const reason=prompt('Why is this noise? (saved as a reusable reason)');
+  if(reason===null) return;
+  if(!reason.trim()){ alert('A reason is required to mark something noise.'); return; }
+  const rid=await ensureNoiseReason(reason);
+  const {error}=await sb.from('applications').update({status:'noise', noise_reason_id:rid}).eq('id',id);
+  if(error){ alert('Failed: '+error.message); return; }
+  await loadAll();
+}
+async function deleteApplication(id){
+  const a=applicationsData.find(x=>x.id===id);
+  const rounds=interviewsData.filter(iv=>iv.application_id===id).length;
+  const links=appContactsData.filter(ac=>ac.application_id===id).length;
+  let warn=`Permanently delete this application?\n\n${a?a.title+' — '+a.company:''}`;
+  if(rounds||links) warn+=`\n\nThis also removes ${rounds} interview round(s) and ${links} contact link(s).`;
+  warn+='\n\nThis cannot be undone.';
+  if(!confirm(warn)) return;
+  const {error}=await sb.from('applications').delete().eq('id',id);
+  if(error){ alert('Delete failed: '+error.message); return; }
+  if(currentAppId===id) closeAppModal();
+  await loadAll();
 }
 function openAppModal(id){
   currentAppId=id;
@@ -425,9 +662,14 @@ function openAppModal(id){
   document.getElementById('app-modal-title').textContent=a.title+' — '+a.company;
   document.getElementById('app-modal-status').value=a.status;
   document.getElementById('app-modal-notes').value=a.notes||'';
+  document.getElementById('app-modal-resume-notes').value=a.resume_notes||'';
+  document.getElementById('needs-resume-cb').checked=!!a.needs_tailored_resume;
+  renderRubric(a);
+  renderResumeCurrent(a);
   renderAppContacts();
   renderAppInterviews();
   populateContactSelect();
+  document.getElementById('round-status').textContent='';
   document.getElementById('app-modal-overlay').style.display='flex';
 }
 function closeAppModal(){ document.getElementById('app-modal-overlay').style.display='none'; currentAppId=null; }
@@ -437,6 +679,82 @@ async function saveAppField(field,value){
   if(error){ alert('Save failed: '+error.message); return; }
   await loadAll();
 }
+
+// ---------- RESUME FIT ----------
+function renderRubric(a){
+  const bd=a.fit_breakdown||{};
+  document.getElementById('rubric-container').innerHTML=RUBRIC.map(r=>`
+    <div class="rubric-row">
+      <label>${r.label}</label>
+      <span class="wt">${Math.round(r.w*100)}%</span>
+      <select id="rb-${r.k}" onchange="recomputeFit()">
+        <option value="">—</option>
+        ${[1,2,3,4,5].map(n=>`<option value="${n}" ${bd[r.k]==n?'selected':''}>${n}</option>`).join('')}
+      </select>
+    </div>`).join('');
+  recomputeFit(true);
+}
+function currentFit(){
+  let sum=0, wsum=0; const bd={};
+  for(const r of RUBRIC){
+    const v=document.getElementById('rb-'+r.k).value;
+    if(v==='') continue;
+    bd[r.k]=Number(v); sum+=Number(v)*r.w; wsum+=r.w;
+  }
+  if(wsum===0) return {score:null, bd:{}};
+  return {score:+(sum/wsum).toFixed(2), bd};
+}
+function recomputeFit(silent){
+  const {score}=currentFit();
+  document.getElementById('fit-score-display').textContent = score===null?'—':score.toFixed(1);
+  if(!silent && score!==null){
+    document.getElementById('needs-resume-cb').checked = score>=FIT_THRESHOLD;
+  }
+}
+async function saveFitScore(){
+  if(!currentAppId) return;
+  const {score,bd}=currentFit();
+  const needs=document.getElementById('needs-resume-cb').checked;
+  const {error}=await sb.from('applications')
+    .update({fit_score:score, fit_breakdown:score===null?null:bd, needs_tailored_resume:needs})
+    .eq('id',currentAppId);
+  if(error){ alert('Save failed: '+error.message); return; }
+  await loadAll();
+  alert(score===null?'Score cleared.':`Saved. Fit ${score.toFixed(1)}/5 — tailored resume ${needs?'needed':'not needed'}.`);
+}
+async function saveResumeFlag(){
+  if(!currentAppId) return;
+  await sb.from('applications').update({needs_tailored_resume:document.getElementById('needs-resume-cb').checked}).eq('id',currentAppId);
+  await loadAll();
+}
+function renderResumeCurrent(a){
+  const el=document.getElementById('resume-current');
+  el.innerHTML = a.tailored_resume_storage_path
+    ? `Attached: <span class="link" onclick="downloadResume('${a.tailored_resume_storage_path}')">download</span>`
+    : 'No tailored resume attached yet.';
+}
+async function uploadResume(){
+  if(!currentAppId) return;
+  const fi=document.getElementById('resume-file');
+  if(!fi.files.length){ alert('Pick a file first.'); return; }
+  const file=fi.files[0];
+  const path=`${currentAppId}/${Date.now()}-${file.name}`;
+  const {error:upErr}=await sb.storage.from('resumes').upload(path,file);
+  if(upErr){ alert('Upload failed: '+upErr.message); return; }
+  const {error}=await sb.from('applications').update({tailored_resume_storage_path:path}).eq('id',currentAppId);
+  if(error){ alert('Save failed: '+error.message); return; }
+  fi.value='';
+  await loadAll();
+  renderResumeCurrent(applicationsData.find(x=>x.id===currentAppId));
+  alert('Resume attached.');
+}
+async function downloadResume(path){
+  const {data,error}=await sb.storage.from('resumes').createSignedUrl(path,60);
+  if(error){ alert('Could not generate link: '+error.message); return; }
+  window.open(data.signedUrl,'_blank');
+}
+
+// ---------- APP CONTACTS ----------
 function renderAppContacts(){
   const container=document.getElementById('app-modal-contacts');
   const links=appContactsData.filter(ac=>ac.application_id===currentAppId);
@@ -444,64 +762,129 @@ function renderAppContacts(){
   container.innerHTML=links.map(l=>{
     const c=contactsData.find(x=>x.id===l.contact_id);
     if(!c) return '';
-    return `<div class="interview-round">${esc(c.name)} <span class="badge ${c.type==='hr'?'applied':'interview'}">${c.type}</span>
-      ${c.organization?' — '+esc(c.organization):''}<br>
-      <span class="muted">${esc(c.phone||'')} ${c.email?' · '+esc(c.email):''}</span></div>`;
+    const org=c.consultant_organization_id
+      ? (consultantOrgsData.find(o=>o.id===c.consultant_organization_id)||{}).name
+      : c.organization;
+    return `<div class="interview-round">${esc(c.name)} <span class="badge ${c.type}">${c.type}</span>
+      ${org?' — '+esc(org):''}<br>
+      <span class="muted">${esc(c.phone||'')} ${c.email?' · '+esc(c.email):''}</span>
+      <button class="btn small secondary" style="float:right" onclick="unlinkContact('${l.id}')">Unlink</button></div>`;
   }).join('');
 }
 function populateContactSelect(){
   const sel=document.getElementById('app-modal-contact-select');
   const linkedIds=appContactsData.filter(ac=>ac.application_id===currentAppId).map(ac=>ac.contact_id);
-  sel.innerHTML=contactsData.filter(c=>!linkedIds.includes(c.id))
-    .map(c=>`<option value="${c.id}">${esc(c.name)} (${c.type})</option>`).join('');
+  const avail=contactsData.filter(c=>!linkedIds.includes(c.id));
+  sel.innerHTML=avail.length
+    ? avail.map(c=>`<option value="${c.id}">${esc(c.name)} (${c.type})</option>`).join('')
+    : '<option value="">No unlinked contacts</option>';
 }
 async function linkContactToApp(){
   const contactId=document.getElementById('app-modal-contact-select').value;
-  if(!contactId||!currentAppId) return;
+  if(!contactId||!currentAppId){ alert('No contact selected.'); return; }
   const {error}=await sb.from('application_contacts').insert({application_id:currentAppId, contact_id:contactId});
   if(error){ alert('Link failed: '+error.message); return; }
   await loadAll();
-  renderAppContacts(); populateContactSelect(); renderApplications();
+  renderAppContacts(); populateContactSelect();
 }
+async function unlinkContact(linkId){
+  const {error}=await sb.from('application_contacts').delete().eq('id',linkId);
+  if(error){ alert('Unlink failed: '+error.message); return; }
+  await loadAll();
+  renderAppContacts(); populateContactSelect();
+}
+
+// ---------- INTERVIEWS ----------
 function renderAppInterviews(){
   const container=document.getElementById('app-modal-interviews');
   const rounds=interviewsData.filter(iv=>iv.application_id===currentAppId);
   if(!rounds.length){ container.innerHTML='<div class="muted">No interview rounds yet.</div>'; return; }
   container.innerHTML=rounds.map(iv=>`<div class="interview-round">
-    <b>Round ${iv.round_number}${iv.stage_label?' — '+esc(iv.stage_label):''}</b><br>
+    <b>Round ${iv.round_number}${iv.stage_label?' — '+esc(iv.stage_label):''}</b>
+    <button class="btn small danger" style="float:right" onclick="deleteInterview('${iv.id}')">Delete</button><br>
     ${iv.interviewer_name?esc(iv.interviewer_name):'<span class="muted">no interviewer name</span>'}
     ${iv.interviewer_linkedin_url?' · <a class="link" href="'+esc(iv.interviewer_linkedin_url)+'" target="_blank">LinkedIn</a>':''}<br>
     <span class="muted">${iv.interview_date||'no date set'}</span>
-    ${iv.transcript_storage_path?' · <span class="link" onclick="downloadTranscript(\''+iv.transcript_storage_path+'\')">Download attachment</span>':''}
+    ${iv.transcript_storage_path?' · <span class="link" onclick="downloadTranscript(\''+iv.transcript_storage_path+'\')">attachment</span>':''}
+    ${iv.notes?'<div style="margin-top:6px"><b>Notes:</b> '+esc(iv.notes)+'</div>':''}
+    ${iv.transcript_text?'<div style="margin-top:6px"><span class="link" onclick="toggleTranscript(\''+iv.id+'\')">show/hide transcript text</span><div id="tr-'+iv.id+'" style="display:none;margin-top:4px;white-space:pre-wrap;max-height:180px;overflow:auto" class="muted">'+esc(iv.transcript_text)+'</div></div>':''}
   </div>`).join('');
 }
+function toggleTranscript(id){
+  const el=document.getElementById('tr-'+id);
+  el.style.display = el.style.display==='none' ? 'block' : 'none';
+}
+function loadScript(src){
+  return new Promise((res,rej)=>{
+    const s=document.createElement('script');
+    s.src=src; s.onload=res; s.onerror=()=>rej(new Error('Could not load '+src));
+    document.head.appendChild(s);
+  });
+}
+async function extractText(file){
+  const name=(file.name||'').toLowerCase();
+  if(/\.(txt|md|csv|json|log)$/.test(name)) return await file.text();
+  if(/\.docx$/.test(name)){
+    if(!window.mammoth) await loadScript('https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js');
+    const buf=await file.arrayBuffer();
+    const r=await window.mammoth.extractRawText({arrayBuffer:buf});
+    return r.value||'';
+  }
+  if(/\.pdf$/.test(name)){
+    if(!window.pdfjsLib) await loadScript('https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js');
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+    const buf=await file.arrayBuffer();
+    const pdf=await window.pdfjsLib.getDocument({data:buf}).promise;
+    let out='';
+    for(let p=1;p<=pdf.numPages;p++){
+      const page=await pdf.getPage(p);
+      const tc=await page.getTextContent();
+      out+=tc.items.map(i=>i.str).join(' ')+'\n\n';
+    }
+    return out.trim();
+  }
+  return null;
+}
 async function addInterviewRound(){
-  if(!currentAppId) return;
+  if(!currentAppId){ alert('No application open.'); return; }
+  const statusEl=document.getElementById('round-status');
   const stage_label=document.getElementById('new-round-stage').value.trim();
   const interviewer_name=document.getElementById('new-round-interviewer').value.trim();
   const interviewer_linkedin_url=document.getElementById('new-round-linkedin').value.trim();
   const interview_date=document.getElementById('new-round-date').value||null;
+  const notes=document.getElementById('new-round-notes').value.trim();
   const fileInput=document.getElementById('new-round-file');
-  const existingRounds=interviewsData.filter(iv=>iv.application_id===currentAppId);
-  const round_number=existingRounds.length+1;
-  let transcript_storage_path=null;
+  const existing=interviewsData.filter(iv=>iv.application_id===currentAppId);
+  const round_number=existing.length?Math.max(...existing.map(r=>r.round_number||0))+1:1;
+
+  let transcript_storage_path=null, transcript_text=null;
   if(fileInput.files.length){
     const file=fileInput.files[0];
+    statusEl.textContent='Extracting text…';
+    try{ transcript_text=await extractText(file); }
+    catch(e){ transcript_text=null; statusEl.textContent='Text extraction failed ('+e.message+') — uploading file anyway.'; }
+    statusEl.textContent='Uploading file…';
     const path=`${currentAppId}/round-${round_number}-${Date.now()}-${file.name}`;
     const {error:upErr}=await sb.storage.from('interview-transcripts').upload(path,file);
-    if(upErr){ alert('File upload failed: '+upErr.message); return; }
+    if(upErr){ statusEl.textContent=''; alert('File upload failed: '+upErr.message); return; }
     transcript_storage_path=path;
   }
   const {error}=await sb.from('interviews').insert({
     application_id:currentAppId, round_number, stage_label, interviewer_name,
-    interviewer_linkedin_url, interview_date, transcript_storage_path
+    interviewer_linkedin_url, interview_date, notes, transcript_storage_path, transcript_text
   });
-  if(error){ alert('Save failed: '+error.message); return; }
-  document.getElementById('new-round-stage').value='';
-  document.getElementById('new-round-interviewer').value='';
-  document.getElementById('new-round-linkedin').value='';
-  document.getElementById('new-round-date').value='';
+  if(error){ statusEl.textContent=''; alert('Save failed: '+error.message); return; }
+  ['new-round-stage','new-round-interviewer','new-round-linkedin','new-round-date','new-round-notes']
+    .forEach(id=>document.getElementById(id).value='');
   fileInput.value='';
+  statusEl.textContent = transcript_text ? `Round added. Extracted ${transcript_text.length} characters of transcript text.` : 'Round added.';
+  await loadAll();
+  renderAppInterviews();
+}
+async function deleteInterview(id){
+  if(!confirm('Delete this interview round? This cannot be undone.')) return;
+  const {error}=await sb.from('interviews').delete().eq('id',id);
+  if(error){ alert('Delete failed: '+error.message); return; }
   await loadAll();
   renderAppInterviews();
 }
@@ -515,18 +898,22 @@ async function downloadTranscript(path){
 async function addContact(){
   const name=document.getElementById('contact-name').value.trim();
   const type=document.getElementById('contact-type').value;
-  const organization=document.getElementById('contact-org').value.trim();
+  const organization=document.getElementById('contact-org').value.trim()||null;
+  const consultant_organization_id=type==='consultant'
+    ? (document.getElementById('contact-consultant-org').value||null) : null;
   const phone=document.getElementById('contact-phone').value.trim();
   const email=document.getElementById('contact-email').value.trim();
   const linkedin_url=document.getElementById('contact-linkedin').value.trim();
   if(!name){ alert('Name is required.'); return; }
-  const {error}=await sb.from('contacts').insert({name,type,organization,phone,email,linkedin_url});
+  if(type==='consultant' && !consultant_organization_id){
+    if(!confirm('No consultancy selected. Add this consultant without one?')) return;
+  }
+  const {error}=await sb.from('contacts').insert({
+    name,type,organization,consultant_organization_id,phone,email,linkedin_url
+  });
   if(error){ alert('Save failed: '+error.message); return; }
-  document.getElementById('contact-name').value='';
-  document.getElementById('contact-org').value='';
-  document.getElementById('contact-phone').value='';
-  document.getElementById('contact-email').value='';
-  document.getElementById('contact-linkedin').value='';
+  ['contact-name','contact-org','contact-phone','contact-email','contact-linkedin']
+    .forEach(id=>document.getElementById(id).value='');
   await loadAll();
 }
 function renderContacts(){
@@ -534,12 +921,109 @@ function renderContacts(){
   tbody.innerHTML='';
   document.getElementById('contacts-empty').style.display=contactsData.length?'none':'block';
   for(const c of contactsData){
+    const org=c.consultant_organization_id
+      ? ((consultantOrgsData.find(o=>o.id===c.consultant_organization_id)||{}).name||'—')
+      : (c.organization||'—');
     const tr=document.createElement('tr');
-    tr.innerHTML=`<td>${esc(c.name)}</td><td><span class="badge ${c.type==='hr'?'applied':'interview'}">${c.type}</span></td>
-      <td>${esc(c.organization||'—')}</td><td>${esc(c.phone||'—')}</td><td>${esc(c.email||'—')}</td>
-      <td>${c.linkedin_url?'<a class="link" href="'+esc(c.linkedin_url)+'" target="_blank">Profile</a>':'—'}</td>`;
+    tr.innerHTML=`<td>${esc(c.name)}</td><td><span class="badge ${c.type}">${c.type}</span></td>
+      <td>${esc(org)}</td><td>${esc(c.phone||'—')}</td><td>${esc(c.email||'—')}</td>
+      <td>${c.linkedin_url?'<a class="link" href="'+esc(c.linkedin_url)+'" target="_blank">Profile</a>':'—'}</td>
+      <td><button class="btn small danger" onclick="deleteContact('${c.id}')">Delete</button></td>`;
     tbody.appendChild(tr);
   }
+}
+async function deleteContact(id){
+  const links=appContactsData.filter(ac=>ac.contact_id===id).length;
+  let msg='Permanently delete this contact?';
+  if(links) msg+=`\n\nThey are linked to ${links} application(s); those links will be removed too.`;
+  if(!confirm(msg)) return;
+  const {error}=await sb.from('contacts').delete().eq('id',id);
+  if(error){ alert('Delete failed: '+error.message); return; }
+  await loadAll();
+}
+
+// ---------- SETUP ----------
+function renderSetup(){
+  const chip=(txt,onDel,inactive)=>`<span class="chip ${inactive?'inactive':''}">${esc(txt)}<button onclick="${onDel}" title="remove">&times;</button></span>`;
+
+  document.getElementById('fc-title-list').innerHTML =
+    filterCriteriaData.filter(f=>f.criterion_type==='title_exclude')
+      .map(f=>chip(f.value, `deleteCriterion('${f.id}')`, !f.is_active)).join('')
+    || '<span class="muted" style="font-size:12px">None</span>';
+
+  document.getElementById('fc-location-list').innerHTML =
+    filterCriteriaData.filter(f=>f.criterion_type==='location_allow')
+      .map(f=>chip(f.value, `deleteCriterion('${f.id}')`, !f.is_active)).join('')
+    || '<span class="muted" style="font-size:12px">None — with no allowed locations set, no lead is excluded on location.</span>';
+
+  document.getElementById('jb-list').innerHTML =
+    jobBoardsData.map(b=>chip(b.name, `deleteJobBoard('${b.id}')`, !b.is_active)).join('')
+    || '<span class="muted" style="font-size:12px">None</span>';
+
+  document.getElementById('co-list').innerHTML =
+    consultantOrgsData.map(o=>chip(o.name, `deleteConsultantOrg('${o.id}')`)).join('')
+    || '<span class="muted" style="font-size:12px">None yet</span>';
+
+  document.getElementById('nr-list').innerHTML =
+    noiseReasonsData.map(r=>chip(r.reason, `deleteNoiseReason('${r.id}')`)).join('')
+    || '<span class="muted" style="font-size:12px">None yet</span>';
+}
+async function addCriterion(){
+  const criterion_type=document.getElementById('fc-type').value;
+  const value=document.getElementById('fc-value').value.trim();
+  if(!value){ alert('Enter a value.'); return; }
+  const {error}=await sb.from('filter_criteria').insert({criterion_type,value});
+  if(error){ alert('Save failed: '+error.message); return; }
+  document.getElementById('fc-value').value='';
+  await loadAll();
+}
+async function deleteCriterion(id){
+  if(!confirm('Remove this filter rule? Existing leads keep whatever status they already have.')) return;
+  const {error}=await sb.from('filter_criteria').delete().eq('id',id);
+  if(error){ alert('Delete failed: '+error.message); return; }
+  await loadAll();
+}
+async function addJobBoard(){
+  const name=document.getElementById('jb-name').value.trim();
+  if(!name){ alert('Enter a name.'); return; }
+  const {error}=await sb.from('job_boards').insert({name});
+  if(error){ alert(error.message.includes('duplicate')?'That board already exists.':'Save failed: '+error.message); return; }
+  document.getElementById('jb-name').value='';
+  await loadAll();
+}
+async function deleteJobBoard(id){
+  const used=leadsData.filter(l=>l.job_board_id===id).length+applicationsData.filter(a=>a.job_board_id===id).length;
+  if(used){ alert(`Can't remove — ${used} record(s) still reference this board.`); return; }
+  if(!confirm('Remove this job board?')) return;
+  const {error}=await sb.from('job_boards').delete().eq('id',id);
+  if(error){ alert('Delete failed: '+error.message); return; }
+  await loadAll();
+}
+async function addConsultantOrg(){
+  const name=document.getElementById('co-name').value.trim();
+  if(!name){ alert('Enter a name.'); return; }
+  const {error}=await sb.from('consultant_organizations').insert({name});
+  if(error){ alert(error.message.includes('duplicate')?'That consultancy already exists.':'Save failed: '+error.message); return; }
+  document.getElementById('co-name').value='';
+  await loadAll();
+}
+async function deleteConsultantOrg(id){
+  const used=contactsData.filter(c=>c.consultant_organization_id===id).length;
+  let msg='Remove this consultancy?';
+  if(used) msg+=`\n\n${used} contact(s) reference it; they'll be left with no consultancy set.`;
+  if(!confirm(msg)) return;
+  const {error}=await sb.from('consultant_organizations').delete().eq('id',id);
+  if(error){ alert('Delete failed: '+error.message); return; }
+  await loadAll();
+}
+async function deleteNoiseReason(id){
+  const used=leadsData.filter(l=>l.noise_reason_id===id).length+applicationsData.filter(a=>a.noise_reason_id===id).length;
+  let msg='Remove this reason?';
+  if(used) msg+=`\n\n${used} record(s) use it; they'll keep their noise status but lose the reason link.`;
+  if(!confirm(msg)) return;
+  const {error}=await sb.from('noise_reasons').delete().eq('id',id);
+  if(error){ alert('Delete failed: '+error.message); return; }
+  await loadAll();
 }
 
 function esc(s){ const d=document.createElement('div'); d.textContent=s==null?'':s; return d.innerHTML; }
