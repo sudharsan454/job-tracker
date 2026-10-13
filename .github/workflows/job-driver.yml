@@ -1,4 +1,4 @@
-# Job Application Driver · permanent runner workflow · v1.0 · 13 Oct 2026
+# Job Application Driver · permanent runner workflow · v1.0.1 · 13 Oct 2026 · v1.0.1: checkout@v5, setup-python@v6 (Node 24)
 # Every 15 min: Gmail alerts -> Gemini fit -> Telegram push -> button replies. Nightly 21:30 IST: status sync + sweeps + digest.
 # Secrets live in GitHub (Settings -> Secrets and variables -> Actions). Without them the runner falls back to a dry run on fixtures.
 name: job-driver
@@ -43,8 +43,8 @@ jobs:
       SUPABASE_URL: https://bxzmneeacjjtwmtdsrjd.supabase.co
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Decide mode
