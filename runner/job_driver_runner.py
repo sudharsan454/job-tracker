@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0.4 · 13 Oct 2026 · v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
+# Job Application Driver · permanent runner · v1.0.5 · 14 Oct 2026 · v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone, date
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 IST = ZoneInfo("Asia/Kolkata")
 OWNER_ID = os.environ.get("OWNER_ID", "f0c721b5-e317-49c4-b02c-d7822411fa55")  # sudharsan454@gmail.com auth user
 PM_STREAM = "11111111-1111-4111-8111-000000000001"
@@ -186,6 +186,8 @@ class Gemini:
     def json(self, system, user, max_tokens=4096):
         if self.dry:
             return FakeLLM.answer(system, user)
+        if self.gave_up_429:
+            raise RuntimeError("gemini 429 (limit): paused, not calling again this run")
         if self.model in ("", "auto", None):
             self.discover()
         for attempt in range(3):
@@ -1036,6 +1038,13 @@ def main():
         settings = Settings(sb)
         llm = Gemini(env["GEMINI_API_KEY"], model if model != "auto" else (settings.get("gemini_model") or "auto"),
                      remember=lambda m: settings.set(gemini_model=m))
+        bo = settings.get("gemini_backoff_until")
+        try:
+            if bo and datetime.fromisoformat(bo) > now_utc():
+                llm.gave_up_429 = True
+                log(f"gemini paused after a recent 429 until {bo}; LinkedIn mails still read by rules, others wait in the retry list")
+        except Exception:
+            pass
         tg = Telegram(env["TELEGRAM_BOT_TOKEN"])
         gmail = Gmail(env["GMAIL_USER"], env["GMAIL_APP_PASSWORD"]).connect()
         fixtures = None
@@ -1104,9 +1113,13 @@ def record_usage(settings, llm, tg, dry):
     if dry:
         log(f"dry run: gemini usage would be {u}")
         return
-    settings.set(gemini_usage=u)
+    patch = {"gemini_usage": u}
+    if llm.n429:
+        patch["gemini_backoff_until"] = iso(now_utc() + timedelta(minutes=60))
+    settings.set(**patch)
     chat = settings.get("telegram_chat_id")
-    if llm.gave_up_429 and chat and settings.get("gemini_429_alert_date") != today:
+    limit_hit_today = u.get("n429", 0) > 0
+    if limit_hit_today and chat and settings.get("gemini_429_alert_date") != today and not in_quiet_hours(settings):
         tg.send(chat, f"⚠️ Gemini free limit hit at {u.get('last_429_at')} IST ({u['calls']} calls today). "
                       "Unread mails are kept and retried on the next runs; the daily quota resets around 12:30–13:30 IST.")
         settings.set(gemini_429_alert_date=today)
