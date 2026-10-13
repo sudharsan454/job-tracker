@@ -1,0 +1,64 @@
+# Job Application Driver · permanent runner workflow · v1.0 · 13 Oct 2026
+# Every 15 min: Gmail alerts -> Gemini fit -> Telegram push -> button replies. Nightly 21:30 IST: status sync + sweeps + digest.
+# Secrets live in GitHub (Settings -> Secrets and variables -> Actions). Without them the runner falls back to a dry run on fixtures.
+name: job-driver
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"      # 15-min loop (UTC; GitHub may delay a few minutes at peak)
+    - cron: "0 16 * * *"        # 21:30 IST nightly
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: run | nightly | verify
+        default: verify
+        type: choice
+        options: [run, nightly, verify]
+      dry_run:
+        description: dry run on fixtures, write nothing
+        type: boolean
+        default: false
+  push:
+    paths:
+      - "runner/**"
+      - ".github/workflows/job-driver.yml"
+
+concurrency:
+  group: job-driver
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  driver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      GMAIL_USER: ${{ secrets.GMAIL_USER }}
+      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      SUPABASE_URL: https://bxzmneeacjjtwmtdsrjd.supabase.co
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Decide mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
+            [ "${{ github.event.inputs.dry_run }}" = "true" ] && echo "flag=--dry-run" >> "$GITHUB_OUTPUT" || echo "flag=" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            echo "mode=run" >> "$GITHUB_OUTPUT"; echo "flag=--dry-run" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 16 * * *" ]; then
+            echo "mode=nightly" >> "$GITHUB_OUTPUT"; echo "flag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=run" >> "$GITHUB_OUTPUT"; echo "flag=" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run
+        run: python runner/job_driver_runner.py ${{ steps.mode.outputs.mode }} ${{ steps.mode.outputs.flag }}
