@@ -1,12 +1,12 @@
-# Job Application Driver · permanent runner workflow · v1.0.3 · 13 Oct 2026 · v1.0.3: no logic change; re-pushed to re-register the schedule (no scheduled run had fired). v1.0.2: cron moved off the hour (4,19,34,49) and nightly to 21:36 IST. v1.0.1: checkout@v5, setup-python@v6 (Node 24)
-# Every 15 min: Gmail alerts -> Gemini fit -> Telegram push -> button replies. Nightly 21:30 IST: status sync + sweeps + digest.
+# Job Application Driver · permanent runner workflow · v1.0.4 · 13 Oct 2026 · v1.0.4: self-chaining. Every run ends by starting the next run about 15 min after it began (GitHub's own token, no extra secret), because GitHub never fired the cron schedule for this repo. A guard skips the hand-off when another run is already queued or running, so chains merge instead of multiplying. Schedule kept as a safety net to restart the chain. Job timeout 25 min (run 1-5 min + wait). v1.0.3: re-push to re-register schedule. v1.0.2: cron off the hour, nightly 21:36 IST. v1.0.1: Node 24 actions.
 # Secrets live in GitHub (Settings -> Secrets and variables -> Actions). Without them the runner falls back to a dry run on fixtures.
+# To stop the loop: Actions -> job-driver -> "..." -> Disable workflow. To restart: enable it, then Run workflow with mode=run and chain=true.
 name: job-driver
 
 on:
   schedule:
-    - cron: "4,19,34,49 * * * *"  # 15-min loop, off the hour (top-of-hour slots are the most delayed on GitHub)
-    - cron: "6 16 * * *"        # 21:36 IST nightly
+    - cron: "4,19,34,49 * * * *"  # safety net only; the chain does the regular work
+    - cron: "6 16 * * *"        # 21:36 IST nightly (runner also does nightly inside the first run after 21:36 IST)
   workflow_dispatch:
     inputs:
       mode:
@@ -16,6 +16,10 @@ on:
         options: [run, nightly, verify]
       dry_run:
         description: dry run on fixtures, write nothing
+        type: boolean
+        default: false
+      chain:
+        description: start the next run ~15 min later (keeps the loop going)
         type: boolean
         default: false
   push:
@@ -29,11 +33,12 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write   # lets GitHub's built-in token start the next run (workflow_dispatch)
 
 jobs:
   driver:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 25
     env:
       GMAIL_USER: ${{ secrets.GMAIL_USER }}
       GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
@@ -42,7 +47,10 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       SUPABASE_URL: https://bxzmneeacjjtwmtdsrjd.supabase.co
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      CHAIN_EVERY_S: "900"
     steps:
+      - name: Note start time
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
@@ -53,12 +61,32 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
             [ "${{ github.event.inputs.dry_run }}" = "true" ] && echo "flag=--dry-run" >> "$GITHUB_OUTPUT" || echo "flag=" >> "$GITHUB_OUTPUT"
+            [ "${{ github.event.inputs.chain }}" = "true" ] && echo "chain=yes" >> "$GITHUB_OUTPUT" || echo "chain=no" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.event_name }}" = "push" ]; then
-            echo "mode=run" >> "$GITHUB_OUTPUT"; echo "flag=--dry-run" >> "$GITHUB_OUTPUT"
+            echo "mode=run" >> "$GITHUB_OUTPUT"; echo "flag=--dry-run" >> "$GITHUB_OUTPUT"; echo "chain=yes" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.event.schedule }}" = "6 16 * * *" ]; then
-            echo "mode=nightly" >> "$GITHUB_OUTPUT"; echo "flag=" >> "$GITHUB_OUTPUT"
+            echo "mode=nightly" >> "$GITHUB_OUTPUT"; echo "flag=" >> "$GITHUB_OUTPUT"; echo "chain=yes" >> "$GITHUB_OUTPUT"
           else
-            echo "mode=run" >> "$GITHUB_OUTPUT"; echo "flag=" >> "$GITHUB_OUTPUT"
+            echo "mode=run" >> "$GITHUB_OUTPUT"; echo "flag=" >> "$GITHUB_OUTPUT"; echo "chain=yes" >> "$GITHUB_OUTPUT"
           fi
       - name: Run
+        id: run
         run: python runner/job_driver_runner.py ${{ steps.mode.outputs.mode }} ${{ steps.mode.outputs.flag }}
+      - name: Chain the next run
+        # push = code test: hand off only if the dry run passed. Everything else hands off even if the run had errors, so the loop never stops by itself.
+        if: ${{ always() && steps.mode.outputs.chain == 'yes' && (github.event_name != 'push' || steps.run.outcome == 'success') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          elapsed=$(( $(date +%s) - JOB_START ))
+          wait=$(( CHAIN_EVERY_S - elapsed - 30 ))
+          if [ "$wait" -gt 0 ]; then echo "waiting ${wait}s so runs stay ~15 min apart"; sleep "$wait"; fi
+          others=$(gh run list --workflow job-driver.yml --limit 20 --json databaseId,status \
+            --jq "[.[] | select(.databaseId != ${{ github.run_id }}) | select(.status==\"queued\" or .status==\"in_progress\" or .status==\"waiting\" or .status==\"pending\" or .status==\"requested\")] | length")
+          if [ "${others:-0}" -gt 0 ]; then
+            echo "another run is already queued or running ($others); not starting a second chain"
+          else
+            gh workflow run job-driver.yml --ref "${{ github.ref_name }}" -f mode=run -f dry_run=false -f chain=true
+            echo "next run started"
+          fi

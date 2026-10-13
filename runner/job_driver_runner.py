@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0.3 · 13 Oct 2026 · v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
+# Job Application Driver · permanent runner · v1.0.4 · 13 Oct 2026 · v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone, date
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 IST = ZoneInfo("Asia/Kolkata")
 OWNER_ID = os.environ.get("OWNER_ID", "f0c721b5-e317-49c4-b02c-d7822411fa55")  # sudharsan454@gmail.com auth user
 PM_STREAM = "11111111-1111-4111-8111-000000000001"
@@ -26,7 +26,9 @@ DEFAULT_SENDERS = ["linkedin.com", "naukri.com", "instahyre.com", "iimjobs.com",
                    "wellfound.com", "indeed.com", "glassdoor.com", "foundit.in", "hiring.cafe", "ycombinator.com", "joblet.in"]
 OPEN_STATUSES = ["applied", "screening", "round_1", "round_2", "round_3", "offer"]
 MAX_MAILS_PER_RUN = 25       # Gemini free tier is rate-limited; the rest carry over to the next run
-EXTRACT_BUDGET_S = 300       # stop reading mails after 5 min so push + replies always run inside the 12-min job
+EXTRACT_BUDGET_S = 300       # stop reading mails after 5 min so push + replies always run inside the job
+MAX_MAIL_TRIES = 3           # a mail that keeps failing is dropped after 3 runs (logged with its message id)
+NIGHTLY_AT = "21:36"         # IST; nightly work runs in the first run at or after this time each day
 
 
 def now_utc():
@@ -123,6 +125,9 @@ class Gemini:
         self.remember = remember  # callable(model_name) that persists the working model
         self.tokens_in = self.tokens_out = 0
         self.candidates = []
+        self.calls = 0          # HTTP generateContent calls this run (pings included)
+        self.n429 = 0           # 429 answers this run
+        self.gave_up_429 = False
 
     def _url(self, model):
         return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.key}"
@@ -167,10 +172,13 @@ class Gemini:
                 "generationConfig": {"temperature": 0.1, "maxOutputTokens": max_tokens, "responseMimeType": "application/json"}}
         if thinking:
             body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
+        self.calls += 1
         try:
             st, d = http("POST", self._url(model), body, timeout=timeout)
         except Exception as e:  # timeouts, resets
             return 599, {"error": str(e)[:200]}
+        if st == 429:
+            self.n429 += 1
         if st == 400 and thinking and "thinking" in str(d).lower():
             return self._call(model, system, user, max_tokens, timeout, thinking=False)
         return st, d
@@ -202,6 +210,9 @@ class Gemini:
                 log(f"gemini {st}, retry in {wait}s")
                 time.sleep(wait)
                 continue
+            if st == 429:
+                self.gave_up_429 = True
+                raise RuntimeError("gemini 429 (limit): gave up after retries")
             raise RuntimeError(f"gemini {st}: {str(d)[:300]}")
         raise RuntimeError("gemini: gave up after retries")
 
@@ -450,6 +461,57 @@ def dedup_key(company, title, location):
     return "|".join(re.sub(r"\s+", " ", (x or "").strip().lower()) for x in (company, title, location))
 
 
+LI_META = re.compile(r"(actively hiring|alumni|connections?$|apply with resume|easy apply|applicants?|early applicant|promoted|actively recruiting|"
+                     r"fast.growing|in your network|\bago$|viewed|reposted|top applicant|hiring now|responses? managed|verified)", re.I)
+LI_AGO = re.compile(r"(\d+)\s*(minute|hour|day|week|month)s?\s+ago", re.I)
+
+
+def parse_linkedin_alert(text):
+    """Fixed-rule reader for LinkedIn job-alert mails (text part: title / company / location lines, then 'View job: <url>').
+    Returns a list of jobs, or None when the layout is not recognised (caller then falls back to Gemini)."""
+    if "View job:" not in text:
+        return None
+    jobs, seen = [], set()
+    chunks = re.split(r"\n-{5,}\n", text)
+    for ch in chunks:
+        m = re.search(r"View job:\s*(https?://\S+)", ch)
+        if not m:
+            continue
+        jid = re.search(r"/jobs/view/(\d+)", m.group(1))
+        if not jid:
+            return None
+        before = [ln.strip() for ln in ch[:m.start()].splitlines()]
+        before = [ln for ln in before if ln and not ln.startswith("<") and "http" not in ln]
+        meta = [ln for ln in before if LI_META.search(ln)]
+        core = [ln for ln in before if not LI_META.search(ln)]
+        if len(core) < 3:
+            return None
+        title, company, location = core[-3], core[-2], core[-1]
+        if len(location) > 60 or len(company) > 100 or len(title) > 200:
+            return None
+        if jid.group(1) in seen:
+            continue
+        seen.add(jid.group(1))
+        ago = next((LI_AGO.search(x).group(0) for x in meta if LI_AGO.search(x)), None)
+        jobs.append({"title": title, "company": company, "location": location,
+                     "url": f"https://www.linkedin.com/jobs/view/{jid.group(1)}/",
+                     "easy_apply": True if any("easy apply" in x.lower() for x in meta) else None,
+                     "posted_text": ago, "snippet": "; ".join(meta)[:200], "stream": None})
+    return jobs or None
+
+
+def stream_by_title(title, streams):
+    """Pick the stream whose target title matches the job title best (longest match); ties go to the PM stream."""
+    t = (title or "").lower()
+    best, best_len = None, 0
+    for s in streams:
+        for tt in s.get("target_titles") or []:
+            k = tt.lower()
+            if k and k in t and (len(k) > best_len or (len(k) == best_len and s["id"] == PM_STREAM)):
+                best, best_len = s, len(k)
+    return best
+
+
 def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None):
     streams, docs, boards, alerts, criteria, noise = load_context(sb)
     stream_by_name = {s["name"].lower(): s for s in streams}
@@ -473,12 +535,15 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None):
             since = (now_utc() - timedelta(days=2)).strftime("%d-%b-%Y")
             uids = gmail.search_uids(["SINCE", since])
         uids = sorted(uids)
+        retry = {int(r["uid"]): int(r.get("tries", 0)) for r in (settings.get("mail_retry") or []) if r.get("uid")}
+        retry_uids = sorted(u for u in retry if u not in uids)
         if len(uids) > MAX_MAILS_PER_RUN:
             run.notes.append(f"{len(uids)} new mails, taking {MAX_MAILS_PER_RUN} this run")
             uids = uids[:MAX_MAILS_PER_RUN]
         max_uid = int(last_uid or 0)
-        for u in uids:
-            max_uid = max(max_uid, u)
+        for u in retry_uids + uids:
+            if u not in retry:
+                max_uid = max(max_uid, u)
             msg = gmail.fetch(u)
             if msg is None:
                 continue
@@ -494,26 +559,45 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None):
                     dt = dt.replace(tzinfo=timezone.utc)
             except Exception:
                 dt = now_utc()
-            mails.append({"uid": u, "msg_id": mid, "from": frm, "subject": msg.get("Subject") or "", "date": dt, "text": mail_text(msg)[:14000]})
+            mails.append({"uid": u, "msg_id": mid, "from": frm, "subject": msg.get("Subject") or "", "date": dt, "text": mail_text(msg)[:14000],
+                          "tries": retry.get(u, 0)})
         if max_uid and not sb.dry:
-            settings.set(imap_last_uid=max_uid)
+            settings.set(imap_last_uid=max_uid)  # always forward; unfinished mails live in mail_retry instead of rewinding
     run.read = len(mails)
     log(f"[sourcer] {len(mails)} alert mails to read")
 
     # 2) extract jobs per mail
     new_leads = []
     t_start = time.time()
-    for m in mails:
+    retry_next = []   # [{"uid", "tries", "msg_id"}] carried to the next run
+    rule_mails = 0
+    for idx, m in enumerate(mails):
         if time.time() - t_start > EXTRACT_BUDGET_S:
-            run.notes.append("time budget hit; remaining mails next run")
-            if not sb.dry:
-                settings.set(imap_last_uid=m["uid"] - 1)  # resume from this mail next time
+            rest = mails[idx:]
+            run.notes.append(f"time budget hit; {len(rest)} mails moved to the retry list")
+            retry_next += [{"uid": x["uid"], "tries": x.get("tries", 0), "msg_id": x["msg_id"]} for x in rest if x["uid"]]
             break
-        try:
-            out = llm.json(EXTRACT_SYS + "\n\nStreams:\n" + stream_desc, f"From: {m['from']}\nSubject: {m['subject']}\nDate: {m['date']}\n\n{m['text']}")
-        except Exception as e:
-            run.errors.append({"mail": m["msg_id"], "stage": "extract", "error": str(e)[:300]})
-            continue
+        out = None
+        if "linkedin.com" in m["from"]:
+            jobs = parse_linkedin_alert(m["text"])
+            if jobs:
+                out = {"is_job_alert": True, "jobs": jobs}
+                rule_mails += 1
+        if out is None:
+            if llm.gave_up_429:
+                # limit already hit this run: don't burn more calls, keep the mail for later
+                retry_next.append({"uid": m["uid"], "tries": m.get("tries", 0), "msg_id": m["msg_id"]})
+                continue
+            try:
+                out = llm.json(EXTRACT_SYS + "\n\nStreams:\n" + stream_desc, f"From: {m['from']}\nSubject: {m['subject']}\nDate: {m['date']}\n\n{m['text']}")
+            except Exception as e:
+                tries = m.get("tries", 0) + 1
+                if m["uid"] and tries < MAX_MAIL_TRIES:
+                    retry_next.append({"uid": m["uid"], "tries": tries, "msg_id": m["msg_id"]})
+                    run.errors.append({"mail": m["msg_id"], "stage": "extract", "error": str(e)[:300], "will_retry": True, "try": tries})
+                else:
+                    run.errors.append({"mail": m["msg_id"], "stage": "extract", "error": str(e)[:300], "dropped_after_tries": tries})
+                continue
         if not out.get("is_job_alert"):
             run.notes.append(f"not a job alert: {m['subject'][:60]}")
             continue
@@ -525,7 +609,8 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None):
                 run.parked += 1
                 continue
             existing.add(key)
-            st = stream_by_name.get((j.get("stream") or "").lower()) or streams[0]
+            st = stream_by_name.get((j.get("stream") or "").lower()) or stream_by_title(j["title"], streams) \
+                or next((s for s in streams if s["id"] == PM_STREAM), streams[0])
             bid, bname = board_for(m["from"], j.get("url"), boards)
             posted = m["date"]
             basis = "email_received"
@@ -548,6 +633,13 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None):
                 run.parked += 1
             new_leads.append(lead)
 
+    if rule_mails:
+        run.notes.append(f"{rule_mails} LinkedIn mails read by rules (no Gemini call)")
+    if dry_fixtures is None and not sb.dry:
+        settings.set(mail_retry=[r for r in retry_next if r.get("uid")][:100])
+    elif retry_next:
+        run.notes.append(f"dry run: {len(retry_next)} mails would go to the retry list")
+
     # 3) fit scoring for live leads, per stream, batches of 8
     live = [l for l in new_leads if l["status"] == "new"]
     for s in streams:
@@ -558,6 +650,9 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None):
             continue
         for i in range(0, len(batch_all), 8):
             batch = batch_all[i:i + 8]
+            if llm.gave_up_429:
+                run.notes.append(f"stream {s['name']}: Gemini limit hit, {len(batch)} leads left unscored for later")
+                break
             payload = {"stream_goal": s.get("goal"), "stream_locations": s.get("locations"), "resume": resume[:9000],
                        "jobs": [{"index": k, "title": l["title"], "company": l["company"], "location": l["location"], "snippet": l["raw_snippet"]} for k, l in enumerate(batch)]}
             try:
@@ -578,6 +673,35 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None):
         run.created = len(rows)
         for aid in {l["alert_definition_id"] for l in new_leads if l.get("alert_definition_id")}:
             sb.update("alert_definitions", {"id": aid}, {"last_lead_at": iso(now_utc())})
+
+    # 5) backlog: leads saved earlier but left unscored (limit hit, error) get scored now, max 16 per run
+    if not llm.gave_up_429:
+        just = {l.get("dedup_key") for l in new_leads}
+        backlog = [l for l in sb.select("leads", {"owner_id": "eq." + OWNER_ID, "status": "eq.new", "created_at": "gte." + iso(now_utc() - timedelta(days=7)),
+                                                   "select": "id,title,company,location,raw_snippet,job_stream_id,dedup_key", "order": "created_at.desc", "limit": "16"})
+                   if l.get("dedup_key") not in just and l.get("id")]
+        thr = int(settings.get("fit_threshold", 60))
+        for s in streams:
+            batch = [l for l in backlog if l.get("job_stream_id") == s["id"]][:8]
+            resume = (docs.get(s.get("generic_document_id")) or {}).get("text") or next((d["text"] for d in docs.values() if d["job_stream_id"] == s["id"]), "")
+            if not batch or not resume or llm.gave_up_429:
+                continue
+            payload = {"stream_goal": s.get("goal"), "stream_locations": s.get("locations"), "resume": resume[:9000],
+                       "jobs": [{"index": k, "title": l["title"], "company": l["company"], "location": l.get("location"), "snippet": l.get("raw_snippet")} for k, l in enumerate(batch)]}
+            try:
+                out = llm.json(FIT_SYS, json.dumps(payload))
+                n = 0
+                for sc in out.get("scores") or []:
+                    l = batch[int(sc["index"])]
+                    fs = sc.get("fit_score")
+                    patch = {"fit_score": fs, "fit_breakdown": sc.get("fit_breakdown"), "status": "fit_checked"}
+                    if fs is not None and fs < thr:
+                        patch.update(status="parked", noise_reason_id=noise.get("Fit below threshold"), matched_criterion="Fit below threshold")
+                    sb.update("leads", {"id": l["id"]}, patch)
+                    n += 1
+                run.notes.append(f"backlog: scored {n} earlier leads ({s['name']})")
+            except Exception as e:
+                run.errors.append({"stage": "fit_backlog", "stream": s["name"], "error": str(e)[:300]})
     return new_leads
 
 
@@ -937,7 +1061,71 @@ def main():
             except Exception as e:
                 r.errors.append({"stage": "replies", "error": str(e)[:300]}); failures += 1
             r.finish()
+            if nightly_due(settings):
+                log("nightly due and not yet done today -> running it inside this run")
+                failures += nightly(sb, gmail, llm, tg, settings, model)
         else:
+            if not dry and settings.get("last_nightly_date") == today_ist().isoformat() and os.environ.get("FORCE_NIGHTLY") != "1":
+                log("nightly already done today (a run after 21:36 IST did it); skipping. Set FORCE_NIGHTLY=1 to force.")
+            else:
+                failures += nightly(sb, gmail, llm, tg, settings, model)
+    finally:
+        try:
+            record_usage(settings, llm, tg, dry)
+        except Exception as e:
+            log(f"usage bookkeeping failed: {e}")
+        if gmail:
+            gmail.close()
+    if dry:
+        print("\n===== DRY RUN PLAN =====")
+        for p in sb.planned:
+            print(json.dumps(p, default=str)[:600])
+        for s in tg.sent:
+            print("TELEGRAM", json.dumps(s, default=str)[:400])
+        print(f"planned writes: {len(sb.planned)}, telegram messages: {len(tg.sent)}")
+    sys.exit(1 if failures else 0)
+
+
+def nightly_due(settings):
+    now = datetime.now(IST)
+    return now.strftime("%H:%M") >= NIGHTLY_AT and settings.get("last_nightly_date") != now.date().isoformat()
+
+
+def record_usage(settings, llm, tg, dry):
+    """Daily Gemini counter in user_settings.gemini_usage, plus one Telegram warning per day when the limit (429) is hit."""
+    today = today_ist().isoformat()
+    u = settings.get("gemini_usage") or {}
+    if u.get("date") != today:
+        u = {"date": today, "calls": 0, "n429": 0}
+    u["calls"] = int(u.get("calls", 0)) + llm.calls
+    u["n429"] = int(u.get("n429", 0)) + llm.n429
+    if llm.n429:
+        u["last_429_at"] = datetime.now(IST).strftime("%H:%M")
+    if dry:
+        log(f"dry run: gemini usage would be {u}")
+        return
+    settings.set(gemini_usage=u)
+    chat = settings.get("telegram_chat_id")
+    if llm.gave_up_429 and chat and settings.get("gemini_429_alert_date") != today:
+        tg.send(chat, f"⚠️ Gemini free limit hit at {u.get('last_429_at')} IST ({u['calls']} calls today). "
+                      "Unread mails are kept and retried on the next runs; the daily quota resets around 12:30–13:30 IST.")
+        settings.set(gemini_429_alert_date=today)
+
+
+def usage_line(settings):
+    u = settings.get("gemini_usage") or {}
+    if u.get("date") != today_ist().isoformat():
+        return "Gemini today: 0 calls"
+    budget = settings.get("gemini_daily_budget")
+    pct = f" ({round(100 * u['calls'] / int(budget))}% of budget {budget})" if budget else ""
+    lim = f", limit hit {u['n429']}x (last {u.get('last_429_at')})" if u.get("n429") else ""
+    return f"Gemini today: {u.get('calls', 0)} calls{pct}{lim}"
+
+
+def nightly(sb, gmail, llm, tg, settings, model):
+    failures = 0
+    if True:
+        if True:
             r = Run(sb, "status_sync", model)
             try:
                 if gmail:
@@ -956,19 +1144,13 @@ def main():
             r.finish()
             chat = settings.get("telegram_chat_id")
             if chat:
-                digest = "🌙 Nightly\n" + ("\n".join(lines) if lines else "Nothing overdue, nothing stale.") + f"\nLeads waiting in Inbox: {waiting}\n{APP_URL}"
+                retry_n = len(settings.get("mail_retry") or [])
+                digest = ("🌙 Nightly\n" + ("\n".join(lines) if lines else "Nothing overdue, nothing stale.") + f"\nLeads waiting in Inbox: {waiting}"
+                          + f"\n{usage_line(settings)}" + (f"\nMails waiting for retry: {retry_n}" if retry_n else "") + f"\n{APP_URL}")
                 tg.send(chat, digest)
-    finally:
-        if gmail:
-            gmail.close()
-    if dry:
-        print("\n===== DRY RUN PLAN =====")
-        for p in sb.planned:
-            print(json.dumps(p, default=str)[:600])
-        for s in tg.sent:
-            print("TELEGRAM", json.dumps(s, default=str)[:400])
-        print(f"planned writes: {len(sb.planned)}, telegram messages: {len(tg.sent)}")
-    sys.exit(1 if failures else 0)
+            if not sb.dry:
+                settings.set(last_nightly_date=today_ist().isoformat())
+    return failures
 
 
 class DrySupabase(Supabase):
