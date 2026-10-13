@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0.2 · 13 Oct 2026 · v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
+# Job Application Driver · permanent runner · v1.0.3 · 13 Oct 2026 · v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone, date
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 IST = ZoneInfo("Asia/Kolkata")
 OWNER_ID = os.environ.get("OWNER_ID", "f0c721b5-e317-49c4-b02c-d7822411fa55")  # sudharsan454@gmail.com auth user
 PM_STREAM = "11111111-1111-4111-8111-000000000001"
@@ -25,6 +25,8 @@ APP_URL = "https://sudharsan454.github.io/jobs/"
 DEFAULT_SENDERS = ["linkedin.com", "naukri.com", "instahyre.com", "iimjobs.com", "hirist.com", "cutshort.io",
                    "wellfound.com", "indeed.com", "glassdoor.com", "foundit.in", "hiring.cafe", "ycombinator.com", "joblet.in"]
 OPEN_STATUSES = ["applied", "screening", "round_1", "round_2", "round_3", "offer"]
+MAX_MAILS_PER_RUN = 25       # Gemini free tier is rate-limited; the rest carry over to the next run
+EXTRACT_BUDGET_S = 300       # stop reading mails after 5 min so push + replies always run inside the 12-min job
 
 
 def now_utc():
@@ -159,7 +161,7 @@ class Gemini:
             log(f"gemini candidate {m} failed ({st}); trying next")
         raise RuntimeError("gemini: no candidate answered: " + ", ".join(tried))
 
-    def _call(self, model, system, user, max_tokens, timeout=120, thinking=True):
+    def _call(self, model, system, user, max_tokens, timeout=75, thinking=True):
         body = {"system_instruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": [{"text": user}]}],
                 "generationConfig": {"temperature": 0.1, "maxOutputTokens": max_tokens, "responseMimeType": "application/json"}}
@@ -178,7 +180,7 @@ class Gemini:
             return FakeLLM.answer(system, user)
         if self.model in ("", "auto", None):
             self.discover()
-        for attempt in range(5):
+        for attempt in range(3):
             st, d = self._call(self.model, system, user, max_tokens)
             if st == 200:
                 um = d.get("usageMetadata", {})
@@ -189,12 +191,14 @@ class Gemini:
                     return json.loads(txt)
                 except Exception as e:
                     raise RuntimeError(f"gemini bad json: {e} {str(d)[:300]}")
-            if st in (404, 599) and attempt == 0:
-                log(f"gemini {self.model} {st}; re-discovering")
+            if st == 404 and attempt == 0:
+                log(f"gemini {self.model} 404; re-discovering")
                 self.discover()
                 continue
-            if st in (429, 500, 503):
-                wait = 15 * (attempt + 1)
+            if st == 599:
+                raise RuntimeError(f"gemini timeout on {self.model}: {str(d)[:120]}")
+            if st in (429, 500, 503) and attempt < 2:
+                wait = 20 * (attempt + 1)
                 log(f"gemini {st}, retry in {wait}s")
                 time.sleep(wait)
                 continue
@@ -468,7 +472,10 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None):
         else:
             since = (now_utc() - timedelta(days=2)).strftime("%d-%b-%Y")
             uids = gmail.search_uids(["SINCE", since])
-        uids = sorted(uids)[-300:]
+        uids = sorted(uids)
+        if len(uids) > MAX_MAILS_PER_RUN:
+            run.notes.append(f"{len(uids)} new mails, taking {MAX_MAILS_PER_RUN} this run")
+            uids = uids[:MAX_MAILS_PER_RUN]
         max_uid = int(last_uid or 0)
         for u in uids:
             max_uid = max(max_uid, u)
@@ -495,7 +502,13 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None):
 
     # 2) extract jobs per mail
     new_leads = []
+    t_start = time.time()
     for m in mails:
+        if time.time() - t_start > EXTRACT_BUDGET_S:
+            run.notes.append("time budget hit; remaining mails next run")
+            if not sb.dry:
+                settings.set(imap_last_uid=m["uid"] - 1)  # resume from this mail next time
+            break
         try:
             out = llm.json(EXTRACT_SYS + "\n\nStreams:\n" + stream_desc, f"From: {m['from']}\nSubject: {m['subject']}\nDate: {m['date']}\n\n{m['text']}")
         except Exception as e:

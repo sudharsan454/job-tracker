@@ -1,12 +1,12 @@
-# Job Application Driver · permanent runner workflow · v1.0.1 · 13 Oct 2026 · v1.0.1: checkout@v5, setup-python@v6 (Node 24)
+# Job Application Driver · permanent runner workflow · v1.0.2 · 13 Oct 2026 · v1.0.2: cron moved off the hour (4,19,34,49) and nightly to 21:36 IST. v1.0.1: checkout@v5, setup-python@v6 (Node 24)
 # Every 15 min: Gmail alerts -> Gemini fit -> Telegram push -> button replies. Nightly 21:30 IST: status sync + sweeps + digest.
 # Secrets live in GitHub (Settings -> Secrets and variables -> Actions). Without them the runner falls back to a dry run on fixtures.
 name: job-driver
 
 on:
   schedule:
-    - cron: "*/15 * * * *"      # 15-min loop (UTC; GitHub may delay a few minutes at peak)
-    - cron: "0 16 * * *"        # 21:30 IST nightly
+    - cron: "4,19,34,49 * * * *"  # 15-min loop, off the hour (top-of-hour slots are the most delayed on GitHub)
+    - cron: "6 16 * * *"        # 21:36 IST nightly
   workflow_dispatch:
     inputs:
       mode:
@@ -55,7 +55,7 @@ jobs:
             [ "${{ github.event.inputs.dry_run }}" = "true" ] && echo "flag=--dry-run" >> "$GITHUB_OUTPUT" || echo "flag=" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.event_name }}" = "push" ]; then
             echo "mode=run" >> "$GITHUB_OUTPUT"; echo "flag=--dry-run" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "0 16 * * *" ]; then
+          elif [ "${{ github.event.schedule }}" = "6 16 * * *" ]; then
             echo "mode=nightly" >> "$GITHUB_OUTPUT"; echo "flag=" >> "$GITHUB_OUTPUT"
           else
             echo "mode=run" >> "$GITHUB_OUTPUT"; echo "flag=" >> "$GITHUB_OUTPUT"
