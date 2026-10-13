@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0 · 13 Oct 2026
+# Job Application Driver · permanent runner · v1.0.1 · 13 Oct 2026 · v1.0.1: Gemini model auto-discovery (newest free Flash), 404 fallback
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -9,7 +9,7 @@
 #   --dry-run any mode:     fixtures instead of Gmail, fake LLM instead of Gemini, nothing written, nothing sent; prints the plan
 #
 # Secrets (GitHub Actions secrets -> env): GMAIL_USER, GMAIL_APP_PASSWORD, GEMINI_API_KEY, TELEGRAM_BOT_TOKEN,
-#   SUPABASE_URL, SUPABASE_SERVICE_KEY. Optional: GEMINI_MODEL (default gemini-2.5-flash), OWNER_ID.
+#   SUPABASE_URL, SUPABASE_SERVICE_KEY. Optional: GEMINI_MODEL (default auto = newest free Flash model), OWNER_ID.
 # Design doc: PMOS/JobTracker/job-application-driver-design-v1.7.html (sections 8, 11, 12).
 
 import argparse, email, email.policy, email.utils, hashlib, html, imaplib, json, os, re, sys, time, traceback, urllib.error, urllib.parse, urllib.request
@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone, date
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0"
+VERSION = "1.0.1"
 IST = ZoneInfo("Asia/Kolkata")
 OWNER_ID = os.environ.get("OWNER_ID", "f0c721b5-e317-49c4-b02c-d7822411fa55")  # sudharsan454@gmail.com auth user
 PM_STREAM = "11111111-1111-4111-8111-000000000001"
@@ -119,9 +119,29 @@ class Gemini:
         self.key, self.model, self.dry = key, model, dry
         self.tokens_in = self.tokens_out = 0
 
+    def discover(self):
+        """Pick the newest non-preview Flash model that supports generateContent (free tier changes names over time)."""
+        st, d = http("GET", f"https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key={self.key}", timeout=60)
+        if st != 200:
+            raise RuntimeError(f"gemini list models {st}: {str(d)[:200]}")
+        names = [m["name"].split("/", 1)[1] for m in d.get("models", []) if "generateContent" in m.get("supportedGenerationMethods", [])]
+        def rank(n):
+            m = re.match(r"gemini-(\d+(?:\.\d+)?)-flash(-lite)?(-preview.*|-\d+)?$", n)
+            if not m:
+                return None
+            return (float(m.group(1)), 0 if m.group(2) else 1, 0 if (m.group(3) or "").startswith("-preview") else 1)
+        ranked = sorted((r, n) for n in names if (r := rank(n)) is not None)
+        if not ranked:
+            raise RuntimeError("gemini: no flash model found in " + ", ".join(names[:20]))
+        self.model = ranked[-1][1]
+        log(f"gemini model -> {self.model}")
+        return self.model
+
     def json(self, system, user, max_tokens=4096):
         if self.dry:
             return FakeLLM.answer(system, user)
+        if self.model in ("", "auto"):
+            self.discover()
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.key}"
         body = {"system_instruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": [{"text": user}]}],
@@ -137,6 +157,11 @@ class Gemini:
                     return json.loads(txt)
                 except Exception as e:
                     raise RuntimeError(f"gemini bad json: {e} {str(d)[:300]}")
+            if st == 404 and attempt == 0:
+                log(f"gemini model {self.model} not found; discovering")
+                self.discover()
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.key}"
+                continue
             if st in (429, 500, 503):
                 wait = 15 * (attempt + 1)
                 log(f"gemini {st}, retry in {wait}s")
@@ -795,7 +820,7 @@ def verify(env):
             log(f"FAIL {name}: {e}")
     chk("supabase", lambda: f"{len(Supabase(env['SUPABASE_URL'], env['SUPABASE_SERVICE_KEY']).select('job_streams', {'select': 'id', 'owner_id': 'eq.' + OWNER_ID}))} streams")
     chk("gmail imap", lambda: (lambda g: (g.close(), "login ok")[1])(Gmail(env["GMAIL_USER"], env["GMAIL_APP_PASSWORD"]).connect()))
-    chk("gemini", lambda: Gemini(env["GEMINI_API_KEY"], env.get("GEMINI_MODEL") or "gemini-2.5-flash").json("Return JSON {\"ok\":true}", "ping"))
+    chk("gemini", lambda: Gemini(env["GEMINI_API_KEY"], env.get("GEMINI_MODEL") or "auto").json("Return JSON {\"ok\":true}", "ping"))
     tg = Telegram(env["TELEGRAM_BOT_TOKEN"])
     chk("telegram", lambda: tg.call("getMe")["result"]["username"])
     sb = Supabase(env["SUPABASE_URL"], env["SUPABASE_SERVICE_KEY"])
@@ -826,7 +851,7 @@ def main():
             sys.exit(2)
         sys.exit(0 if verify(env) else 1)
 
-    model = env.get("GEMINI_MODEL") or "gemini-2.5-flash"
+    model = env.get("GEMINI_MODEL") or "auto"
     if dry:
         sb = DrySupabase()
         llm = Gemini("", model, dry=True)
