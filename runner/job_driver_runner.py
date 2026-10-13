@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0.1 · 13 Oct 2026 · v1.0.1: Gemini model auto-discovery (newest free Flash), 404 fallback
+# Job Application Driver · permanent runner · v1.0.2 · 13 Oct 2026 · v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone, date
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 IST = ZoneInfo("Asia/Kolkata")
 OWNER_ID = os.environ.get("OWNER_ID", "f0c721b5-e317-49c4-b02c-d7822411fa55")  # sudharsan454@gmail.com auth user
 PM_STREAM = "11111111-1111-4111-8111-000000000001"
@@ -115,12 +115,17 @@ class Supabase:
 
 # ---------------------------------------------------------------- Gemini (free tier) with a fake for dry runs
 class Gemini:
-    def __init__(self, key, model, dry=False):
+    """Gemini via REST. Model 'auto' = newest Flash model that actually answers a 30s ping (free-tier models come and go)."""
+    def __init__(self, key, model, dry=False, remember=None):
         self.key, self.model, self.dry = key, model, dry
+        self.remember = remember  # callable(model_name) that persists the working model
         self.tokens_in = self.tokens_out = 0
+        self.candidates = []
 
-    def discover(self):
-        """Pick the newest non-preview Flash model that supports generateContent (free tier changes names over time)."""
+    def _url(self, model):
+        return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.key}"
+
+    def list_candidates(self):
         st, d = http("GET", f"https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key={self.key}", timeout=60)
         if st != 200:
             raise RuntimeError(f"gemini list models {st}: {str(d)[:200]}")
@@ -130,24 +135,51 @@ class Gemini:
             if not m:
                 return None
             return (float(m.group(1)), 0 if m.group(2) else 1, 0 if (m.group(3) or "").startswith("-preview") else 1)
-        ranked = sorted((r, n) for n in names if (r := rank(n)) is not None)
-        if not ranked:
+        ranked = sorted(((r, n) for n in names if (r := rank(n)) is not None), reverse=True)
+        self.candidates = [n for _, n in ranked]
+        if not self.candidates:
             raise RuntimeError("gemini: no flash model found in " + ", ".join(names[:20]))
-        self.model = ranked[-1][1]
-        log(f"gemini model -> {self.model}")
-        return self.model
+        return self.candidates
+
+    def discover(self):
+        tried = []
+        for m in self.list_candidates()[:6]:
+            t0 = time.time()
+            st, d = self._call(m, 'Return JSON {"ok":true}', "ping", 64, timeout=30)
+            if st == 200:
+                self.model = m
+                log(f"gemini model -> {m} ({time.time()-t0:.1f}s)")
+                if self.remember:
+                    try:
+                        self.remember(m)
+                    except Exception:
+                        pass
+                return m
+            tried.append(f"{m}:{st}")
+            log(f"gemini candidate {m} failed ({st}); trying next")
+        raise RuntimeError("gemini: no candidate answered: " + ", ".join(tried))
+
+    def _call(self, model, system, user, max_tokens, timeout=120, thinking=True):
+        body = {"system_instruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": [{"text": user}]}],
+                "generationConfig": {"temperature": 0.1, "maxOutputTokens": max_tokens, "responseMimeType": "application/json"}}
+        if thinking:
+            body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
+        try:
+            st, d = http("POST", self._url(model), body, timeout=timeout)
+        except Exception as e:  # timeouts, resets
+            return 599, {"error": str(e)[:200]}
+        if st == 400 and thinking and "thinking" in str(d).lower():
+            return self._call(model, system, user, max_tokens, timeout, thinking=False)
+        return st, d
 
     def json(self, system, user, max_tokens=4096):
         if self.dry:
             return FakeLLM.answer(system, user)
-        if self.model in ("", "auto"):
+        if self.model in ("", "auto", None):
             self.discover()
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.key}"
-        body = {"system_instruction": {"parts": [{"text": system}]},
-                "contents": [{"role": "user", "parts": [{"text": user}]}],
-                "generationConfig": {"temperature": 0.1, "maxOutputTokens": max_tokens, "responseMimeType": "application/json"}}
         for attempt in range(5):
-            st, d = http("POST", url, body, timeout=120)
+            st, d = self._call(self.model, system, user, max_tokens)
             if st == 200:
                 um = d.get("usageMetadata", {})
                 self.tokens_in += um.get("promptTokenCount", 0)
@@ -157,10 +189,9 @@ class Gemini:
                     return json.loads(txt)
                 except Exception as e:
                     raise RuntimeError(f"gemini bad json: {e} {str(d)[:300]}")
-            if st == 404 and attempt == 0:
-                log(f"gemini model {self.model} not found; discovering")
+            if st in (404, 599) and attempt == 0:
+                log(f"gemini {self.model} {st}; re-discovering")
                 self.discover()
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.key}"
                 continue
             if st in (429, 500, 503):
                 wait = 15 * (attempt + 1)
@@ -820,11 +851,12 @@ def verify(env):
             log(f"FAIL {name}: {e}")
     chk("supabase", lambda: f"{len(Supabase(env['SUPABASE_URL'], env['SUPABASE_SERVICE_KEY']).select('job_streams', {'select': 'id', 'owner_id': 'eq.' + OWNER_ID}))} streams")
     chk("gmail imap", lambda: (lambda g: (g.close(), "login ok")[1])(Gmail(env["GMAIL_USER"], env["GMAIL_APP_PASSWORD"]).connect()))
-    chk("gemini", lambda: Gemini(env["GEMINI_API_KEY"], env.get("GEMINI_MODEL") or "auto").json("Return JSON {\"ok\":true}", "ping"))
-    tg = Telegram(env["TELEGRAM_BOT_TOKEN"])
-    chk("telegram", lambda: tg.call("getMe")["result"]["username"])
     sb = Supabase(env["SUPABASE_URL"], env["SUPABASE_SERVICE_KEY"])
     settings = Settings(sb)
+    g = Gemini(env["GEMINI_API_KEY"], env.get("GEMINI_MODEL") or "auto", remember=lambda m: settings.set(gemini_model=m))
+    chk("gemini", lambda: (g.json("Return JSON {\"ok\":true}", "ping"), g.model)[1])
+    tg = Telegram(env["TELEGRAM_BOT_TOKEN"])
+    chk("telegram", lambda: tg.call("getMe")["result"]["username"])
     run = Run(sb, "verify", "-")
     chk("telegram link", lambda: f"{replies(sb, tg, settings, run)} updates; chat_id={settings.get('telegram_chat_id')}")
     if settings.get("telegram_chat_id"):
@@ -864,9 +896,10 @@ def main():
         fixtures = [open(os.path.join(os.path.dirname(__file__), "fixtures", f)).read() for f in sorted(os.listdir(os.path.join(os.path.dirname(__file__), "fixtures"))) if f.endswith(".txt")]
     else:
         sb = Supabase(env["SUPABASE_URL"], env["SUPABASE_SERVICE_KEY"])
-        llm = Gemini(env["GEMINI_API_KEY"], model)
-        tg = Telegram(env["TELEGRAM_BOT_TOKEN"])
         settings = Settings(sb)
+        llm = Gemini(env["GEMINI_API_KEY"], model if model != "auto" else (settings.get("gemini_model") or "auto"),
+                     remember=lambda m: settings.set(gemini_model=m))
+        tg = Telegram(env["TELEGRAM_BOT_TOKEN"])
         gmail = Gmail(env["GMAIL_USER"], env["GMAIL_APP_PASSWORD"]).connect()
         fixtures = None
 
