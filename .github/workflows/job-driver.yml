@@ -1,4 +1,4 @@
-# Job Application Driver · permanent runner workflow · v1.0.2 · 13 Oct 2026 · v1.0.2: cron moved off the hour (4,19,34,49) and nightly to 21:36 IST. v1.0.1: checkout@v5, setup-python@v6 (Node 24)
+# Job Application Driver · permanent runner workflow · v1.0.3 · 13 Oct 2026 · v1.0.3: no logic change; re-pushed to re-register the schedule (no scheduled run had fired). v1.0.2: cron moved off the hour (4,19,34,49) and nightly to 21:36 IST. v1.0.1: checkout@v5, setup-python@v6 (Node 24)
 # Every 15 min: Gmail alerts -> Gemini fit -> Telegram push -> button replies. Nightly 21:30 IST: status sync + sweeps + digest.
 # Secrets live in GitHub (Settings -> Secrets and variables -> Actions). Without them the runner falls back to a dry run on fixtures.
 name: job-driver
