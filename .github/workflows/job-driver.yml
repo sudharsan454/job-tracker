@@ -1,4 +1,4 @@
-# Job Application Driver · permanent runner workflow · v1.0.6 · 14 Oct 2026 · v1.0.6: runs every 2 hours (was 15 min, your call 14 Oct); work and wait split into two jobs so a code push is not stuck behind the wait; "newest run owns the loop" guard; GROQ_API_KEY passed to the runner. v1.0.4: self-chaining (GitHub never fired the cron schedule). v1.0.2: cron off the hour. v1.0.1: Node 24 actions.
+# Job Application Driver · permanent runner workflow · v1.0.7 · 14 Oct 2026 · v1.0.7: after a code push whose dry run passes, the first real run starts right away (no 2-hour wait). v1.0.6: runs every 2 hours (was 15 min, your call 14 Oct); work and wait split into two jobs so a code push is not stuck behind the wait; "newest run owns the loop" guard; GROQ_API_KEY passed to the runner. v1.0.4: self-chaining (GitHub never fired the cron schedule). v1.0.2: cron off the hour. v1.0.1: Node 24 actions.
 # Secrets live in GitHub (Settings -> Secrets and variables -> Actions). Without them the runner falls back to a dry run on fixtures.
 # To stop the loop: Actions -> job-driver -> "..." -> Disable workflow. To restart: enable it, then Run workflow with mode=run and chain=true.
 # To change the gap: edit CHAIN_EVERY_S below (seconds) and keep the chain job's timeout-minutes above it.
@@ -93,6 +93,7 @@ jobs:
         run: |
           start="${{ needs.driver.outputs.start }}"; [ -z "$start" ] && start=$(date +%s)
           wait=$(( CHAIN_EVERY_S - ( $(date +%s) - start ) - 60 ))
+          if [ "${{ github.event_name }}" = "push" ]; then wait=0; echo "code push: dry run passed, starting the real loop now"; fi
           if [ "$wait" -gt 0 ]; then echo "waiting ${wait}s so runs stay ~2 h apart"; sleep "$wait"; fi
           # Newest run owns the loop: if a newer run that chains is queued or running, it starts the next one, so this run steps aside.
           newer=$(gh run list --workflow job-driver.yml --limit 30 --json databaseId,status,displayTitle \
