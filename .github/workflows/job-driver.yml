@@ -1,12 +1,14 @@
-# Job Application Driver · permanent runner workflow · v1.0.5 · 14 Oct 2026 · v1.0.5: runner v1.0.5 only (Gemini pause after 429, no night warnings); no workflow logic change. v1.0.4: self-chaining. Every run ends by starting the next run about 15 min after it began (GitHub's own token, no extra secret), because GitHub never fired the cron schedule for this repo. A guard skips the hand-off when another run is already queued or running, so chains merge instead of multiplying. Schedule kept as a safety net to restart the chain. Job timeout 25 min (run 1-5 min + wait). v1.0.3: re-push to re-register schedule. v1.0.2: cron off the hour, nightly 21:36 IST. v1.0.1: Node 24 actions.
+# Job Application Driver · permanent runner workflow · v1.0.6 · 14 Oct 2026 · v1.0.6: runs every 2 hours (was 15 min, your call 14 Oct); work and wait split into two jobs so a code push is not stuck behind the wait; "newest run owns the loop" guard; GROQ_API_KEY passed to the runner. v1.0.4: self-chaining (GitHub never fired the cron schedule). v1.0.2: cron off the hour. v1.0.1: Node 24 actions.
 # Secrets live in GitHub (Settings -> Secrets and variables -> Actions). Without them the runner falls back to a dry run on fixtures.
 # To stop the loop: Actions -> job-driver -> "..." -> Disable workflow. To restart: enable it, then Run workflow with mode=run and chain=true.
+# To change the gap: edit CHAIN_EVERY_S below (seconds) and keep the chain job's timeout-minutes above it.
 name: job-driver
+run-name: "job-driver ${{ inputs.mode || github.event_name }} chain=${{ inputs.chain }}"
 
 on:
   schedule:
-    - cron: "4,19,34,49 * * * *"  # safety net only; the chain does the regular work
-    - cron: "6 16 * * *"        # 21:36 IST nightly (runner also does nightly inside the first run after 21:36 IST)
+    - cron: "4 */2 * * *"   # safety net only (GitHub has not fired it so far); the chain does the regular work
+    - cron: "6 16 * * *"    # 21:36 IST nightly (runner also catches up nightly in the first run after 21:36 IST)
   workflow_dispatch:
     inputs:
       mode:
@@ -19,17 +21,13 @@ on:
         type: boolean
         default: false
       chain:
-        description: start the next run ~15 min later (keeps the loop going)
+        description: start the next run ~2 hours later (keeps the loop going)
         type: boolean
         default: false
   push:
     paths:
       - "runner/**"
       - ".github/workflows/job-driver.yml"
-
-concurrency:
-  group: job-driver
-  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -38,19 +36,27 @@ permissions:
 jobs:
   driver:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
+    concurrency:
+      group: job-driver-work
+      cancel-in-progress: false
+    outputs:
+      chain: ${{ steps.mode.outputs.chain }}
+      start: ${{ steps.start.outputs.t }}
     env:
       GMAIL_USER: ${{ secrets.GMAIL_USER }}
       GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GROQ_MODEL: ${{ vars.GROQ_MODEL }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       SUPABASE_URL: https://bxzmneeacjjtwmtdsrjd.supabase.co
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      CHAIN_EVERY_S: "900"
     steps:
       - name: Note start time
-        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+        id: start
+        run: echo "t=$(date +%s)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
@@ -70,22 +76,29 @@ jobs:
             echo "mode=run" >> "$GITHUB_OUTPUT"; echo "flag=" >> "$GITHUB_OUTPUT"; echo "chain=yes" >> "$GITHUB_OUTPUT"
           fi
       - name: Run
-        id: run
         run: python runner/job_driver_runner.py ${{ steps.mode.outputs.mode }} ${{ steps.mode.outputs.flag }}
-      - name: Chain the next run
-        # push = code test: hand off only if the dry run passed. Everything else hands off even if the run had errors, so the loop never stops by itself.
-        if: ${{ always() && steps.mode.outputs.chain == 'yes' && (github.event_name != 'push' || steps.run.outcome == 'success') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+
+  chain:
+    # Waits, then starts the next run. push = code test: hand off only if the dry run passed; otherwise hand off even if the run had errors.
+    needs: driver
+    if: ${{ always() && needs.driver.outputs.chain == 'yes' && (github.event_name != 'push' || needs.driver.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      CHAIN_EVERY_S: "7200"
+    steps:
+      - name: Wait, then start the next run
         run: |
-          elapsed=$(( $(date +%s) - JOB_START ))
-          wait=$(( CHAIN_EVERY_S - elapsed - 30 ))
-          if [ "$wait" -gt 0 ]; then echo "waiting ${wait}s so runs stay ~15 min apart"; sleep "$wait"; fi
-          others=$(gh run list --workflow job-driver.yml --limit 20 --json databaseId,status \
-            --jq "[.[] | select(.databaseId != ${{ github.run_id }}) | select(.status==\"queued\" or .status==\"in_progress\" or .status==\"waiting\" or .status==\"pending\" or .status==\"requested\")] | length")
-          if [ "${others:-0}" -gt 0 ]; then
-            echo "another run is already queued or running ($others); not starting a second chain"
+          start="${{ needs.driver.outputs.start }}"; [ -z "$start" ] && start=$(date +%s)
+          wait=$(( CHAIN_EVERY_S - ( $(date +%s) - start ) - 60 ))
+          if [ "$wait" -gt 0 ]; then echo "waiting ${wait}s so runs stay ~2 h apart"; sleep "$wait"; fi
+          # Newest run owns the loop: if a newer run that chains is queued or running, it starts the next one, so this run steps aside.
+          newer=$(gh run list --workflow job-driver.yml --limit 30 --json databaseId,status,displayTitle \
+            --jq "[.[] | select(.databaseId > ${{ github.run_id }}) | select(.status != \"completed\") | select(.displayTitle | contains(\"chain=false\") | not)] | length")
+          if [ "${newer:-0}" -gt 0 ]; then
+            echo "a newer run ($newer) owns the loop; not starting another"
           else
             gh workflow run job-driver.yml --ref "${{ github.ref_name }}" -f mode=run -f dry_run=false -f chain=true
             echo "next run started"

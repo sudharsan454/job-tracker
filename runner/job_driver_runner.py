@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0.5 · 14 Oct 2026 · v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
+# Job Application Driver · permanent runner · v1.0.6 · 14 Oct 2026 · v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone, date
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 IST = ZoneInfo("Asia/Kolkata")
 OWNER_ID = os.environ.get("OWNER_ID", "f0c721b5-e317-49c4-b02c-d7822411fa55")  # sudharsan454@gmail.com auth user
 PM_STREAM = "11111111-1111-4111-8111-000000000001"
@@ -217,6 +217,101 @@ class Gemini:
                 raise RuntimeError("gemini 429 (limit): gave up after retries")
             raise RuntimeError(f"gemini {st}: {str(d)[:300]}")
         raise RuntimeError("gemini: gave up after retries")
+
+
+class Groq:
+    """Groq free tier via its OpenAI-style API. Backup brain when Gemini is over its limit or failing."""
+    PREFER = ["gpt-oss-120b", "gpt-oss-20b", "llama-3.3-70b", "qwen"]
+
+    def __init__(self, key, model=""):
+        self.key, self.model = key, model
+        self.h = {"Authorization": "Bearer " + key}
+        self.calls = self.n429 = self.tokens_in = self.tokens_out = 0
+        self.gave_up_429 = False
+
+    def pick_model(self):
+        st, d = http("GET", "https://api.groq.com/openai/v1/models", headers=self.h, timeout=30)
+        if st != 200:
+            raise RuntimeError(f"groq models {st}: {str(d)[:200]}")
+        ids = [m["id"] for m in d.get("data", []) if m.get("active", True)]
+        for pref in self.PREFER:
+            hit = next((i for i in ids if pref in i), None)
+            if hit:
+                self.model = hit
+                return hit
+        raise RuntimeError("groq: no preferred model in " + ", ".join(ids[:15]))
+
+    def json(self, system, user, max_tokens=4096):
+        if self.gave_up_429:
+            raise RuntimeError("groq 429 (limit): paused this run")
+        if not self.model:
+            self.pick_model()
+        body = {"model": self.model, "temperature": 0.1, "max_completion_tokens": max_tokens,
+                "response_format": {"type": "json_object"},
+                "messages": [{"role": "system", "content": system + "\nReply with one JSON object only."}, {"role": "user", "content": user[:24000]}]}
+        if "gpt-oss" in self.model:
+            body["reasoning_effort"] = "low"
+        for attempt in range(2):
+            self.calls += 1
+            try:
+                st, d = http("POST", "https://api.groq.com/openai/v1/chat/completions", body, headers=self.h, timeout=75)
+            except Exception as e:
+                raise RuntimeError(f"groq timeout: {str(e)[:120]}")
+            if st == 400 and "reasoning_effort" in body:
+                body.pop("reasoning_effort")
+                continue
+            if st == 200:
+                u = d.get("usage") or {}
+                self.tokens_in += u.get("prompt_tokens", 0)
+                self.tokens_out += u.get("completion_tokens", 0)
+                try:
+                    return json.loads(d["choices"][0]["message"]["content"])
+                except Exception as e:
+                    raise RuntimeError(f"groq bad json: {e}")
+            if st == 429:
+                self.n429 += 1
+                if attempt == 0:
+                    time.sleep(15)
+                    continue
+                self.gave_up_429 = True
+                raise RuntimeError("groq 429 (limit): gave up")
+            raise RuntimeError(f"groq {st}: {str(d)[:300]}")
+        raise RuntimeError("groq: gave up")
+
+
+class LLM:
+    """Gemini first; Groq when Gemini is paused, over its limit or failing. Same .json() interface as Gemini."""
+    def __init__(self, gem, groq=None):
+        self.gem, self.groq = gem, groq
+        self.used_groq = 0
+
+    @property
+    def gave_up_429(self):
+        return self.gem.gave_up_429 and (self.groq is None or self.groq.gave_up_429)
+
+    @property
+    def tokens_in(self):
+        return self.gem.tokens_in + (self.groq.tokens_in if self.groq else 0)
+
+    @property
+    def tokens_out(self):
+        return self.gem.tokens_out + (self.groq.tokens_out if self.groq else 0)
+
+    def json(self, system, user, max_tokens=4096):
+        err = None
+        if not self.gem.gave_up_429:
+            try:
+                return self.gem.json(system, user, max_tokens)
+            except Exception as e:
+                err = e
+                if self.groq is None:
+                    raise
+                log(f"gemini failed ({str(e)[:80]}); using groq")
+        if self.groq is None:
+            raise err or RuntimeError("gemini 429 (limit): paused, not calling again this run")
+        out = self.groq.json(system, user, max_tokens)
+        self.used_groq += 1
+        return out
 
 
 class FakeLLM:
@@ -994,6 +1089,11 @@ def verify(env):
     settings = Settings(sb)
     g = Gemini(env["GEMINI_API_KEY"], env.get("GEMINI_MODEL") or "auto", remember=lambda m: settings.set(gemini_model=m))
     chk("gemini", lambda: (g.json("Return JSON {\"ok\":true}", "ping"), g.model)[1])
+    if os.environ.get("GROQ_API_KEY"):
+        q = Groq(os.environ["GROQ_API_KEY"], os.environ.get("GROQ_MODEL", ""))
+        chk("groq", lambda: (q.json("Return JSON {\"ok\":true}", "ping"), q.model)[1])
+    else:
+        log("INFO groq: no GROQ_API_KEY secret, backup off")
     tg = Telegram(env["TELEGRAM_BOT_TOKEN"])
     chk("telegram", lambda: tg.call("getMe")["result"]["username"])
     run = Run(sb, "verify", "-")
@@ -1025,7 +1125,7 @@ def main():
     model = env.get("GEMINI_MODEL") or "auto"
     if dry:
         sb = DrySupabase()
-        llm = Gemini("", model, dry=True)
+        llm = LLM(Gemini("", model, dry=True))
         tg = Telegram("dry", dry=True)
         tg.dry_updates = [{"update_id": 101, "callback_query": {"id": "cq1", "data": "ag|lead-old", "message": {"message_id": 7, "chat": {"id": 1}}}},
                           {"update_id": 102, "callback_query": {"id": "cq2", "data": "tl|lead-old", "message": {"message_id": 8, "chat": {"id": 1}}}},
@@ -1036,15 +1136,19 @@ def main():
     else:
         sb = Supabase(env["SUPABASE_URL"], env["SUPABASE_SERVICE_KEY"])
         settings = Settings(sb)
-        llm = Gemini(env["GEMINI_API_KEY"], model if model != "auto" else (settings.get("gemini_model") or "auto"),
+        gem = Gemini(env["GEMINI_API_KEY"], model if model != "auto" else (settings.get("gemini_model") or "auto"),
                      remember=lambda m: settings.set(gemini_model=m))
-        bo = settings.get("gemini_backoff_until")
-        try:
-            if bo and datetime.fromisoformat(bo) > now_utc():
-                llm.gave_up_429 = True
-                log(f"gemini paused after a recent 429 until {bo}; LinkedIn mails still read by rules, others wait in the retry list")
-        except Exception:
-            pass
+        groq = Groq(os.environ["GROQ_API_KEY"], os.environ.get("GROQ_MODEL", "")) if os.environ.get("GROQ_API_KEY") else None
+        log("groq backup: " + ("on" if groq else "off (no GROQ_API_KEY secret)"))
+        for key, obj in (("gemini_backoff_until", gem), ("groq_backoff_until", groq)):
+            bo = settings.get(key)
+            try:
+                if obj and bo and datetime.fromisoformat(bo) > now_utc():
+                    obj.gave_up_429 = True
+                    log(f"{key.split('_')[0]} paused after a recent 429 until {bo}")
+            except Exception:
+                pass
+        llm = LLM(gem, groq)
         tg = Telegram(env["TELEGRAM_BOT_TOKEN"])
         gmail = Gmail(env["GMAIL_USER"], env["GMAIL_APP_PASSWORD"]).connect()
         fixtures = None
@@ -1074,7 +1178,7 @@ def main():
                 log("nightly due and not yet done today -> running it inside this run")
                 failures += nightly(sb, gmail, llm, tg, settings, model)
         else:
-            if not dry and settings.get("last_nightly_date") == today_ist().isoformat() and os.environ.get("FORCE_NIGHTLY") != "1":
+            if not dry and not nightly_due(settings) and os.environ.get("FORCE_NIGHTLY") != "1":
                 log("nightly already done today (a run after 21:36 IST did it); skipping. Set FORCE_NIGHTLY=1 to force.")
             else:
                 failures += nightly(sb, gmail, llm, tg, settings, model)
@@ -1096,8 +1200,11 @@ def main():
 
 
 def nightly_due(settings):
+    """Due once per day: after 21:36 IST for today, or (if that slot was missed) before 21:36 for yesterday."""
     now = datetime.now(IST)
-    return now.strftime("%H:%M") >= NIGHTLY_AT and settings.get("last_nightly_date") != now.date().isoformat()
+    target = now.date() if now.strftime("%H:%M") >= NIGHTLY_AT else now.date() - timedelta(days=1)
+    last = settings.get("last_nightly_date") or ""
+    return last < target.isoformat()
 
 
 def record_usage(settings, llm, tg, dry):
@@ -1106,22 +1213,33 @@ def record_usage(settings, llm, tg, dry):
     u = settings.get("gemini_usage") or {}
     if u.get("date") != today:
         u = {"date": today, "calls": 0, "n429": 0}
-    u["calls"] = int(u.get("calls", 0)) + llm.calls
-    u["n429"] = int(u.get("n429", 0)) + llm.n429
-    if llm.n429:
+    gem, groq = llm.gem, llm.groq
+    u["calls"] = int(u.get("calls", 0)) + gem.calls
+    u["n429"] = int(u.get("n429", 0)) + gem.n429
+    if gem.n429:
         u["last_429_at"] = datetime.now(IST).strftime("%H:%M")
+    g = settings.get("groq_usage") or {}
+    if g.get("date") != today:
+        g = {"date": today, "calls": 0, "n429": 0}
+    if groq:
+        g["calls"] = int(g.get("calls", 0)) + groq.calls
+        g["n429"] = int(g.get("n429", 0)) + groq.n429
     if dry:
-        log(f"dry run: gemini usage would be {u}")
+        log(f"dry run: gemini usage would be {u}; groq {g}")
         return
-    patch = {"gemini_usage": u}
-    if llm.n429:
+    patch = {"gemini_usage": u, "groq_usage": g}
+    if gem.n429:
         patch["gemini_backoff_until"] = iso(now_utc() + timedelta(minutes=60))
+    if groq and groq.gave_up_429:
+        patch["groq_backoff_until"] = iso(now_utc() + timedelta(minutes=60))
     settings.set(**patch)
     chat = settings.get("telegram_chat_id")
-    limit_hit_today = u.get("n429", 0) > 0
-    if limit_hit_today and chat and settings.get("gemini_429_alert_date") != today and not in_quiet_hours(settings):
-        tg.send(chat, f"⚠️ Gemini free limit hit at {u.get('last_429_at')} IST ({u['calls']} calls today). "
-                      "Unread mails are kept and retried on the next runs; the daily quota resets around 12:30–13:30 IST.")
+    # warn only when no brain is left (Gemini limited and Groq absent or limited too)
+    both_down = u.get("n429", 0) > 0 and (groq is None or g.get("n429", 0) > 0 or llm.gave_up_429)
+    if both_down and chat and settings.get("gemini_429_alert_date") != today and not in_quiet_hours(settings):
+        tg.send(chat, f"⚠️ AI limit hit: Gemini at {u.get('last_429_at')} IST ({u['calls']} calls today)"
+                      + ("" if groq is None else f", Groq too ({g.get('calls', 0)} calls)") + ". "
+                      "Unread mails are kept and retried on later runs; Gemini resets around 12:30–13:30 IST.")
         settings.set(gemini_429_alert_date=today)
 
 
@@ -1132,7 +1250,9 @@ def usage_line(settings):
     budget = settings.get("gemini_daily_budget")
     pct = f" ({round(100 * u['calls'] / int(budget))}% of budget {budget})" if budget else ""
     lim = f", limit hit {u['n429']}x (last {u.get('last_429_at')})" if u.get("n429") else ""
-    return f"Gemini today: {u.get('calls', 0)} calls{pct}{lim}"
+    g = settings.get("groq_usage") or {}
+    gq = f" · Groq backup: {g.get('calls', 0)} calls" if g.get("date") == today_ist().isoformat() and g.get("calls") else ""
+    return f"Gemini today: {u.get('calls', 0)} calls{pct}{lim}{gq}"
 
 
 def nightly(sb, gmail, llm, tg, settings, model):
@@ -1162,7 +1282,9 @@ def nightly(sb, gmail, llm, tg, settings, model):
                           + f"\n{usage_line(settings)}" + (f"\nMails waiting for retry: {retry_n}" if retry_n else "") + f"\n{APP_URL}")
                 tg.send(chat, digest)
             if not sb.dry:
-                settings.set(last_nightly_date=today_ist().isoformat())
+                now = datetime.now(IST)
+                done_for = now.date() if now.strftime("%H:%M") >= NIGHTLY_AT else now.date() - timedelta(days=1)
+                settings.set(last_nightly_date=done_for.isoformat())
     return failures
 
 
