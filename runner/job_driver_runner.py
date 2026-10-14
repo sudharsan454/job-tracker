@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0.6 · 14 Oct 2026 · v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
+# Job Application Driver · permanent runner · v1.0.7 · 14 Oct 2026 · v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone, date
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 IST = ZoneInfo("Asia/Kolkata")
 OWNER_ID = os.environ.get("OWNER_ID", "f0c721b5-e317-49c4-b02c-d7822411fa55")  # sudharsan454@gmail.com auth user
 PM_STREAM = "11111111-1111-4111-8111-000000000001"
@@ -1202,8 +1202,11 @@ def main():
 def nightly_due(settings):
     """Due once per day: after 21:36 IST for today, or (if that slot was missed) before 21:36 for yesterday."""
     now = datetime.now(IST)
-    target = now.date() if now.strftime("%H:%M") >= NIGHTLY_AT else now.date() - timedelta(days=1)
+    catch_up = now.strftime("%H:%M") < NIGHTLY_AT
+    target = now.date() - timedelta(days=1) if catch_up else now.date()
     last = settings.get("last_nightly_date") or ""
+    if catch_up and in_quiet_hours(settings):
+        return False  # yesterday's digest waits until quiet hours end
     return last < target.isoformat()
 
 
