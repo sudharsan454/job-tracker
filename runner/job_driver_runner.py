@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0.10 · 17 Oct 2026 · v1.0.10: fit replies are normalised before the format check (a bare list of scores, a single score object, or scores under "results"/"jobs" are accepted), and a reply that still fails is logged with its first 200 characters. v1.0.9: JD Fetcher (v1.0.8) merged with the agents config. Reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. The JD Fetcher has its own agent row (on/off, max pages per run); JD re-scoring uses the rubric; fit batch defaults to 4. Falls back to built-in behaviour if the agents table cannot be read. v1.0.8: JD Fetcher. Every live lead gets its full job description (LinkedIn public job page, no login; else the company's own apply/careers page via JSON-LD or page text) saved in leads.jd_text before Fit runs, and Fit now scores against the JD (batches of 4). Earlier leads and open applications without a JD are filled in later runs (max 3 tries each, then jd_confidence=fetch_failed). Leads already scored get re-scored once their JD lands. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
+# Job Application Driver · permanent runner · v1.0.11 · 17 Oct 2026 · v1.0.11: Jev (TypeSafe, via Vercel AI Gateway, secret AI_GATEWAY_API_KEY) as the judge for the new Resume Decider (picklist generic / tailored / not_run / failed on leads; per-stream criteria from the Agents screen; Jev scores each criterion, code applies weights and threshold; Gemini/Groq as backup; low-confidence flag; Failed after 3 tries) and as a shadow fit scorer (leads.fit_shadow, never used for decisions until it passes the eval gate). v1.0.10: fit replies are normalised before the format check (a bare list of scores, a single score object, or scores under "results"/"jobs" are accepted), and a reply that still fails is logged with its first 200 characters. v1.0.9: JD Fetcher (v1.0.8) merged with the agents config. Reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. The JD Fetcher has its own agent row (on/off, max pages per run); JD re-scoring uses the rubric; fit batch defaults to 4. Falls back to built-in behaviour if the agents table cannot be read. v1.0.8: JD Fetcher. Every live lead gets its full job description (LinkedIn public job page, no login; else the company's own apply/careers page via JSON-LD or page text) saved in leads.jd_text before Fit runs, and Fit now scores against the JD (batches of 4). Earlier leads and open applications without a JD are filled in later runs (max 3 tries each, then jd_confidence=fetch_failed). Leads already scored get re-scored once their JD lands. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -9,7 +9,8 @@
 #   --dry-run any mode:     fixtures instead of Gmail, fake LLM instead of Gemini, nothing written, nothing sent; prints the plan
 #
 # Secrets (GitHub Actions secrets -> env): GMAIL_USER, GMAIL_APP_PASSWORD, GEMINI_API_KEY, TELEGRAM_BOT_TOKEN,
-#   SUPABASE_URL, SUPABASE_SERVICE_KEY. Optional: GEMINI_MODEL (default auto = newest free Flash model), OWNER_ID.
+#   SUPABASE_URL, SUPABASE_SERVICE_KEY. Optional: GEMINI_MODEL (default auto = newest free Flash model), OWNER_ID,
+#   AI_GATEWAY_API_KEY (Vercel AI Gateway, for Jev), JEV_MODEL (default typesafe-ai/jev).
 # Design doc: PMOS/JobTracker/job-application-driver-design-v1.7.html (sections 8, 11, 12).
 
 import argparse, math, email, email.policy, email.utils, hashlib, html, imaplib, json, os, re, sys, time, traceback, urllib.error, urllib.parse, urllib.request
@@ -17,7 +18,7 @@ from datetime import datetime, timedelta, timezone, date
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.10"
+VERSION = "1.0.11"
 IST = ZoneInfo("Asia/Kolkata")
 OWNER_ID = os.environ.get("OWNER_ID", "f0c721b5-e317-49c4-b02c-d7822411fa55")  # sudharsan454@gmail.com auth user
 PM_STREAM = "11111111-1111-4111-8111-000000000001"
@@ -347,6 +348,9 @@ class FakeLLM:
             n = user.count('"title"')
             return {"scores": [{"index": i, "fit_score": 72 - 9 * i, "fit_breakdown": {"basis": "fixture", "role_level": "PM", "domain": "SaaS",
                      "location": "Chennai", "must_haves": "unknown until the JD is read", "note": "dry run score"}} for i in range(n)]}
+        if "DECIDE_RESUME" in system:
+            keys = re.findall(r'\(key "([a-z0-9_]+)"', system)
+            return {"params": {k: {"score": 40 + 5 * j, "why": "fixture"} for j, k in enumerate(keys)}, "direct": "generic"}
         if "CLASSIFY_STATUS" in system:
             return {"outcome": "rejected", "company": "Fixture Co", "verbatim": "Unfortunately we will not be moving forward.", "confidence": 0.9}
         return {}
@@ -1547,7 +1551,9 @@ def fmt_lead(l):
     return (f"<b>{html.escape(l['title'])}</b> · {html.escape(l['company'])}\n"
             f"{html.escape(l.get('location') or '—')} · fit <b>{l.get('fit_score') if l.get('fit_score') is not None else '?'}</b> · {l.get('age_days', '?')}d old"
             f"{' · easy apply' if l.get('easy_apply') else ''}\n"
-            f"{html.escape(str(fb.get('note') or fb.get('domain') or ''))[:160]}")
+            f"{html.escape(str(fb.get('note') or fb.get('domain') or ''))[:160]}"
+            + (f"\nResume: <b>{'Tailor' if l.get('resume_decision') == 'tailored' else 'Generic is enough'}</b>{' (unsure, your call)' if l.get('resume_low_confidence') else ''} · {html.escape(str(l.get('resume_reason') or ''))[:120]}"
+               if l.get("resume_decision") in ("generic", "tailored") else ""))
 
 
 def buttons_for(l):
@@ -1579,7 +1585,7 @@ def notifier(sb, tg, settings, run):
     rubrics = load_rubrics(sb, streams)
     thrs = [stream_threshold(rubrics, settings, s["id"]) for s in streams] or [float(settings.get("fit_threshold", 60))]
     leads = sb.select("leads", {"owner_id": "eq." + OWNER_ID, "status": "eq.fit_checked", "fit_score": "gte." + fmt_num(min(thrs)),
-                                "select": "id,title,company,location,url,fit_score,fit_breakdown,age_days,easy_apply,created_at,job_stream_id", "order": "fit_score.desc,created_at.desc", "limit": "50"})
+                                "select": "id,title,company,location,url,fit_score,fit_breakdown,age_days,easy_apply,created_at,job_stream_id,resume_decision,resume_low_confidence,resume_reason", "order": "fit_score.desc,created_at.desc", "limit": "50"})
     leads = [l for l in leads if l["id"] not in notified and float(l.get("fit_score") or 0) >= stream_threshold(rubrics, settings, l.get("job_stream_id"))][:budget]
     n = 0
     for l in leads:
@@ -1829,6 +1835,291 @@ def sweeps(sb, settings, run):
 
 
 # ---------------------------------------------------------------- verify
+# ---------------------------------------------------------------- Jev (TypeSafe) via Vercel AI Gateway + Resume Decider + Fit shadow (v1.0.9)
+# Jev answers typed questions (score / boolean / choice) with probabilities; it never writes text.
+# Every rubric parameter becomes one Score question (criteria = the three anchors low/mid/high -> 10/50/90) plus one Boolean
+# "is there enough information to judge it?". The weighting, if-unknown rule and caps stay in compute_fit, same as the Gemini path.
+JEV_URL = "https://ai-gateway.vercel.sh/v1/evaluate"
+JEV_JD_CHARS, JEV_RESUME_CHARS, JEV_NOTES_CHARS = 12000, 9000, 6000   # Vercel caps Jev at 32K tokens per request
+RESUME_SYS = "DECIDE_RESUME. You decide how much a candidate's generic resume needs tailoring for one job. JSON only."
+
+
+class Jev:
+    def __init__(self, key, model=None, dry=False):
+        self.key, self.dry = key, dry
+        self.model = model or os.environ.get("JEV_MODEL") or "typesafe-ai/jev"
+        self.calls = self.errors = self.tokens_in = 0
+        self.cost = 0.0
+
+    def evaluate(self, state, questions, timeout=60):
+        self.calls += 1
+        if self.dry:
+            out = {}
+            for k, q in questions.items():
+                if q["type"] == "score":
+                    out[k] = {"type": "score", "score": 1.4, "probabilities": {"0": 0.1, "1": 0.4, "2": 0.5}}
+                elif q["type"] == "boolean":
+                    out[k] = {"type": "boolean", "probability": 0.8}
+                else:
+                    first = list(q["criteria"])[-1]
+                    out[k] = {"type": "choice", "choice": first, "probabilities": {c: (0.7 if c == first else 0.3) for c in q["criteria"]}}
+            return out
+        st, d = http("POST", JEV_URL, {"model": self.model, "state": state, "questions": questions},
+                     headers={"Authorization": "Bearer " + self.key}, timeout=timeout)
+        if st >= 300 or not isinstance(d, dict):
+            self.errors += 1
+            raise RuntimeError(f"jev {st}: {str(d)[:240]}")
+        self.tokens_in += int(((d.get("usage") or {}).get("inputTokens")) or 0)
+        try:
+            self.cost += float((((d.get("providerMetadata") or {}).get("gateway") or {}).get("cost")) or 0)
+        except Exception:
+            pass
+        return d.get("answers") or {}
+
+
+def jev_rubric_questions(rub):
+    qs = {}
+    for p in (rub or {}).get("params") or []:
+        if p.get("enabled") is False:
+            continue
+        a = p.get("anchors") or {}
+        qs["s_" + p["key"]] = {"type": "score", "instructions": f'{p.get("name")}: {p.get("description") or ""}',
+                               "criteria": [f'about 10: {a.get("low") or "low"}', f'about 50: {a.get("mid") or "medium"}', f'about 90: {a.get("high") or "high"}']}
+        qs["k_" + p["key"]] = {"type": "boolean", "instructions": f'Is there enough information here to judge "{p.get("name")}"?',
+                               "criteria": {"true": "the details given are enough to judge it", "false": "key details are missing (for example only a job title is known, or no career notes are given)"}}
+    return qs
+
+
+def jev_param_scores(rub, answers, force_unknown=()):
+    """{key: {"score": 0-100|None, "why": str, "p": confidence}} from Jev answers."""
+    clean = {}
+    for p in (rub or {}).get("params") or []:
+        if p.get("enabled") is False:
+            continue
+        k = p["key"]
+        s, ok = answers.get("s_" + k) or {}, answers.get("k_" + k) or {}
+        judge_p = float(ok.get("probability", 1.0)) if ok else 1.0
+        conf = max([float(v) for v in (s.get("probabilities") or {}).values()] or [0.0])
+        score = None
+        if k not in force_unknown and s.get("score") is not None and judge_p >= 0.5:
+            score = int(round(max(0.0, min(100.0, 10 + 40 * float(s["score"])))))
+        clean[k] = {"score": score, "why": (f"jev rung {float(s.get('score', 0)):.2f}, p={conf:.2f}" if score is not None else f"cannot judge (p={judge_p:.2f})"), "p": round(conf, 3)}
+    return clean
+
+
+def jev_state(lead, stream, resume, notes=None, extra=None):
+    st = {"job": {"title": lead.get("title"), "company": lead.get("company"), "location": lead.get("location"),
+                  "snippet": lead.get("raw_snippet") or lead.get("snippet"), "job_description": ((lead.get("jd_text") or "")[:JEV_JD_CHARS] or "not fetched")},
+          "job_stream": {"name": stream.get("name"), "goal": stream.get("goal"), "locations": stream.get("locations")},
+          "candidate_resume": (resume or "")[:JEV_RESUME_CHARS]}
+    if notes is not None:
+        st["career_notes"] = (notes or "")[:JEV_NOTES_CHARS] or "none given"
+    st.update(extra or {})
+    return st
+
+
+def load_agent_rubrics(sb, streams, field):
+    ids = [s.get(field) for s in streams if s.get(field)]
+    if not ids:
+        return {}
+    try:
+        rows = sb.select("fit_rubric_versions", {"id": "in.(" + ",".join(ids) + ")", "select": "id,version,job_stream_id,rubric"})
+    except Exception as e:
+        log(f"rubrics ({field}) not readable: {str(e)[:120]}")
+        return {}
+    return {r["job_stream_id"]: r for r in rows if r.get("id") in ids}
+
+
+def fit_shadow(sb, jev, run, limit=20):
+    """Jev scores the same leads Gemini scored, with the same fit rubric, into leads.fit_shadow (never used for decisions)."""
+    if not jev:
+        return 0
+    streams, docs, _, _, _, _ = load_context(sb)
+    rubrics = load_rubrics(sb, streams)
+    try:
+        leads = sb.select("leads", {"owner_id": "eq." + OWNER_ID, "fit_score": "not.is.null", "fit_shadow": "is.null", "created_at": "gte." + iso(now_utc() - timedelta(days=21)),
+                                    "select": "id,title,company,location,raw_snippet,jd_text,job_stream_id", "order": "created_at.desc", "limit": str(limit)})
+    except Exception as e:
+        run.notes.append(f"fit shadow: leads not readable ({str(e)[:80]})")
+        return 0
+    n = 0
+    for l in leads:
+        s = next((x for x in streams if x["id"] == l.get("job_stream_id")), None)
+        rv = rubrics.get(l.get("job_stream_id"))
+        if not s or not rv:
+            continue
+        rub = rv["rubric"]
+        try:
+            ans = jev.evaluate(jev_state(l, s, resume_for(s, docs)), jev_rubric_questions(rub))
+        except Exception as e:
+            run.errors.append({"stage": "fit_shadow", "lead": l["id"], "error": str(e)[:240]})
+            if jev.errors >= 3:
+                break
+            continue
+        params = jev_param_scores(rub, ans)
+        total, caps = compute_fit(rub, params)
+        sb.update("leads", {"id": l["id"]}, {"fit_shadow": {"engine": "jev", "model": jev.model, "score": total, "params": params, "caps_applied": caps,
+                                                            "rubric_version": rv.get("version"), "at": iso(now_utc())}})
+        n += 1
+    if n:
+        run.notes.append(f"fit shadow: Jev scored {n} leads")
+    return n
+
+
+def _resume_reason(rub, params, decision):
+    ps = [p for p in (rub or {}).get("params") or [] if p.get("enabled") is not False and (params.get(p["key"]) or {}).get("score") is not None]
+    if decision == "tailored":
+        top = sorted(ps, key=lambda p: -float(p.get("weight") or 0) * params[p["key"]]["score"])[:2]
+    else:
+        top = sorted(ps, key=lambda p: float(p.get("weight") or 0) * params[p["key"]]["score"])[:2]
+    return "; ".join(f'{p.get("name")} {params[p["key"]]["score"]}' for p in top)
+
+
+def resume_decider(sb, llm, agents, settings, run):
+    """Generic or Tailored for each lead at or above its stream's fit threshold. Picklist: generic | tailored | not_run | failed."""
+    cfg = agents.get("resume_decider") or {}
+    jev = getattr(llm, "jev", None)
+    streams, docs, _, _, _, _ = load_context(sb)
+    try:
+        full = sb.select("job_streams", {"owner_id": "eq." + OWNER_ID, "select": "id,resume_rubric_version_id"})
+    except Exception as e:
+        run.notes.append(f"resume decider: needs schema resume-decider v1.0 ({str(e)[:80]})")
+        return 0
+    rmap = {x["id"]: x.get("resume_rubric_version_id") for x in full}
+    for s in streams:
+        s["resume_rubric_version_id"] = rmap.get(s["id"])
+    rrubs = load_agent_rubrics(sb, streams, "resume_rubric_version_id")
+    frubs = load_rubrics(sb, streams)
+    limit = max(1, int(cfg.get("max_items") or 10))
+    leads = sb.select("leads", {"owner_id": "eq." + OWNER_ID, "status": "in.(fit_checked,promoted)", "resume_decision": "eq.not_run", "fit_score": "not.is.null",
+                                "created_at": "gte." + iso(now_utc() - timedelta(days=21)),
+                                "select": "id,title,company,location,raw_snippet,jd_text,job_stream_id,fit_score,easy_apply,resume_attempts",
+                                "order": "fit_score.desc,created_at.desc", "limit": str(limit * 3)})
+    leads = [l for l in leads if float(l.get("fit_score") or 0) >= stream_threshold(frubs, settings, l.get("job_stream_id"))][:limit]
+    if not leads:
+        run.notes.append("resume decider: nothing to decide")
+        return 0
+    try:
+        targets = {(t.get("name") or "").strip().lower() for t in sb.select("target_companies", {"owner_id": "eq." + OWNER_ID, "select": "name"})}
+    except Exception:
+        targets = set()
+    notes = settings.get("career_notes") or ""
+    margin = guard_value(cfg, "low_confidence_ask", 8)
+    max_tries = int(guard_value(cfg, "max_attempts", 3) or 3)
+    order = [(cfg.get("model") or {}).get("primary") or "jev", (cfg.get("model") or {}).get("fallback") or "gemini"]
+    llm_r = AgentLLM(llm, cfg)
+    n = 0
+    for l in leads:
+        s = next((x for x in streams if x["id"] == l.get("job_stream_id")), None)
+        rv = rrubs.get(l.get("job_stream_id"))
+        attempts = int(l.get("resume_attempts") or 0) + 1
+        try:
+            if not s or not rv:
+                raise RuntimeError("no Resume Decider criteria for this stream")
+            resume = resume_for(s, docs)
+            if not resume:
+                raise RuntimeError("no generic resume for this stream")
+            rub = rv["rubric"]
+            force_unknown = () if notes.strip() else ("hidden_experience",)
+            state = jev_state(l, s, resume, notes, {"on_target_company_list": (l.get("company") or "").strip().lower() in targets, "easy_apply": bool(l.get("easy_apply"))})
+            params = direct = None
+            engine, last_err = None, None
+            for eng in order:
+                try:
+                    if eng == "jev":
+                        if not jev:
+                            raise RuntimeError("no AI_GATEWAY_API_KEY secret")
+                        qs = jev_rubric_questions(rub)
+                        qs["direct"] = {"type": "choice", "instructions": "Should the candidate send the generic resume as it is, or tailor it for this job?",
+                                        "criteria": {"generic": "the generic resume already fits this job well enough", "tailored": "the resume should be rewritten to fit this job"}}
+                        ans = jev.evaluate(state, qs, timeout=int((cfg.get("model") or {}).get("timeout_s") or 60))
+                        params = jev_param_scores(rub, ans, force_unknown)
+                        direct = ans.get("direct") or {}
+                        engine = "jev"
+                    elif eng in ("gemini", "groq"):
+                        system = RESUME_SYS + "\nScore each parameter 0-100 against its anchors. A higher score means more need to tailor.\n" + render_rubric(rub) + \
+                                 '\n\nOutput format (fixed by the system): JSON only.\n{"params":{"<parameter key>":{"score":<0-100 or null>,"why":"<under 120 chars>"}},"direct":"generic|tailored"}'
+                        out = llm_json_checked(llm_r, system, json.dumps(state), lambda o: isinstance(o, dict) and isinstance(o.get("params"), dict))
+                        params = {}
+                        for p in rub.get("params") or []:
+                            if p.get("enabled") is False:
+                                continue
+                            v = out["params"].get(p["key"])
+                            sc = None if p["key"] in force_unknown else _score(v)
+                            params[p["key"]] = {"score": int(round(sc)) if sc is not None else None, "why": str((v or {}).get("why") if isinstance(v, dict) else "")[:160]}
+                        d = str(out.get("direct") or "").lower()
+                        direct = {"choice": d, "probabilities": {}} if d in ("generic", "tailored") else {}
+                        engine = llm_r.label
+                    else:
+                        continue
+                    break
+                except Exception as e:
+                    last_err = e
+                    log(f"resume decider: {eng} failed ({str(e)[:100]}); trying the next engine")
+            if params is None:
+                raise last_err or RuntimeError("no engine available")
+            total, _ = compute_fit(rub, params)
+            if total is None:
+                raise RuntimeError("no parameter could be judged")
+            thr = float(rub.get("threshold", 55))
+            decision = "tailored" if total >= thr else "generic"
+            dchoice = (direct or {}).get("choice")
+            conf = (direct or {}).get("probabilities", {}).get(decision) if dchoice else None
+            low = (margin is not None and abs(total - thr) < float(margin)) or (dchoice in ("generic", "tailored") and dchoice != decision)
+            sb.update("leads", {"id": l["id"]}, {
+                "resume_decision": decision, "resume_score": total, "resume_reason": _resume_reason(rub, params, decision)[:300],
+                "resume_confidence": round(float(conf), 3) if conf is not None else None, "resume_low_confidence": bool(low), "resume_engine": engine,
+                "resume_rubric_version_id": rv["id"], "resume_attempts": attempts, "resume_error": None, "resume_decided_at": iso(now_utc()),
+                "resume_breakdown": {"params": params, "threshold": thr, "direct": direct, "rubric_version": rv.get("version"), "career_notes": bool(notes.strip())}})
+            n += 1
+        except Exception as e:
+            patch = {"resume_attempts": attempts, "resume_error": str(e)[:300]}
+            if attempts >= max_tries:
+                patch["resume_decision"] = "failed"
+            sb.update("leads", {"id": l["id"]}, patch)
+            run.errors.append({"stage": "resume_decider", "lead": l["id"], "attempt": attempts, "error": str(e)[:240]})
+    run.notes.append(f"resume decider: decided {n} of {len(leads)}" + (f" · jev ${jev.cost:.5f}" if jev and jev.cost else ""))
+    run.model = ",".join(dict.fromkeys(x for x in ["jev" if jev and jev.calls else None, llm_r.label if llm_r.label != "-" else None] if x)) or "-"
+    return n
+
+
+def jev_cycle(sb, llm, settings, agents):
+    """Resume Decider (if due) then Fit shadow. One agent_runs row each."""
+    failures = 0
+    jev = getattr(llm, "jev", None)
+    do_r, why_r = due(agents, "resume_decider", "cycle") if "resume_decider" in agents else (False, "no agents row (schema resume-decider v1.0 needed)")
+    if do_r:
+        r = Run(sb, "resume_decider", "jev")
+        try:
+            resume_decider(sb, llm, agents, settings, r)
+        except Exception as e:
+            r.errors.append({"stage": "resume_decider", "error": str(e)[:300], "trace": traceback.format_exc()[-800:]}); failures += 1
+        r.finish()
+        mark(sb, agents, "resume_decider", True, "ran with errors" if r.errors else "ran")
+    else:
+        log(f"resume decider: {why_r}")
+        mark(sb, agents, "resume_decider", False, "skipped: " + why_r)
+    if jev:
+        r = Run(sb, "fit_shadow", "jev")
+        try:
+            fit_shadow(sb, jev, r)
+        except Exception as e:
+            r.errors.append({"stage": "fit_shadow", "error": str(e)[:300]})
+        r.finish()
+    if jev and jev.calls and not sb.dry:
+        u = settings.get("jev_usage") or {}
+        day = today_ist().isoformat() if hasattr(today_ist(), "isoformat") else str(today_ist())
+        if u.get("date") != day:
+            u = {"date": day, "calls": 0, "cost": 0.0}
+        u["calls"] = int(u.get("calls", 0)) + jev.calls
+        u["cost"] = round(float(u.get("cost", 0)) + jev.cost, 6)
+        try:
+            settings.set(jev_usage=u)
+        except Exception as e:
+            log(f"jev usage not saved: {e}")
+    return failures
+
+
 def verify(env):
     ok = True
     def chk(name, fn):
@@ -1850,6 +2141,11 @@ def verify(env):
         chk("groq", lambda: (q.json("Return JSON {\"ok\":true}", "ping"), q.model)[1])
     else:
         log("INFO groq: no GROQ_API_KEY secret, backup off")
+    if os.environ.get("AI_GATEWAY_API_KEY"):
+        jv = Jev(os.environ["AI_GATEWAY_API_KEY"])
+        chk("jev", lambda: (jv.evaluate("The job title is Senior Product Manager.", {"pm": {"type": "boolean", "instructions": "Is this a product management job?"}}), f"{jv.model} ok, ${jv.cost:.6f}")[1])
+    else:
+        log("INFO jev: no AI_GATEWAY_API_KEY secret, Resume Decider uses Gemini/Groq")
     tg = Telegram(env["TELEGRAM_BOT_TOKEN"])
     chk("telegram", lambda: tg.call("getMe")["result"]["username"])
     run = Run(sb, "verify", "-")
@@ -1882,6 +2178,7 @@ def main():
     if dry:
         sb = DrySupabase()
         llm = LLM(Gemini("", model, dry=True))
+        llm.jev = Jev("", dry=True)
         tg = Telegram("dry", dry=True)
         tg.dry_updates = [{"update_id": 101, "callback_query": {"id": "cq1", "data": "ag|lead-old", "message": {"message_id": 7, "chat": {"id": 1}}}},
                           {"update_id": 102, "callback_query": {"id": "cq2", "data": "tl|lead-old", "message": {"message_id": 8, "chat": {"id": 1}}}},
@@ -1905,6 +2202,8 @@ def main():
             except Exception:
                 pass
         llm = LLM(gem, groq)
+        llm.jev = Jev(os.environ["AI_GATEWAY_API_KEY"]) if os.environ.get("AI_GATEWAY_API_KEY") else None
+        log("jev: " + (f"on ({llm.jev.model})" if llm.jev else "off (no AI_GATEWAY_API_KEY secret)"))
         tg = Telegram(env["TELEGRAM_BOT_TOKEN"])
         gmail = Gmail(env["GMAIL_USER"], env["GMAIL_APP_PASSWORD"]).connect()
         fixtures = None
@@ -2046,6 +2345,10 @@ def source_and_fit(sb, gmail, llm, settings, model, agents, fixtures, phase):
 
 def cycle(sb, gmail, llm, tg, settings, model, agents, fixtures):
     failures = source_and_fit(sb, gmail, llm, settings, model, agents, fixtures, "cycle")
+    try:
+        failures += jev_cycle(sb, llm, settings, agents)
+    except Exception as e:
+        log(f"resume decider / fit shadow failed: {e}")
     do_n, why_n = due(agents, "notifier", "cycle")
     r = Run(sb, "notifier", "-")
     if do_n:
@@ -2135,7 +2438,13 @@ class DrySupabase(Supabase):
                 {"key": "location", "name": "Location", "weight": 15, "enabled": True, "description": "city", "anchors": {"high": "Chennai", "mid": "Bengaluru", "low": "other"}, "cap": {"below": 30, "max": 50}, "if_unknown": "neutral"},
                 {"key": "must_haves", "name": "Must-haves", "weight": 15, "enabled": True, "description": "JD", "anchors": {"high": "all", "mid": "most", "low": "none"}, "cap": None, "if_unknown": "skip"}]}
             self.tables["job_streams"][0]["fit_rubric_version_id"] = "rv1"
-            self.tables["fit_rubric_versions"] = [{"id": "rv1", "version": 1, "job_stream_id": PM_STREAM, "rubric": rub}]
+            self.tables["job_streams"][0]["resume_rubric_version_id"] = "rr1"
+            rrub = {"threshold": 55, "params": [
+                {"key": "must_have_gaps", "name": "Must-haves missing", "weight": 30, "enabled": True, "description": "top of resume", "anchors": {"high": "2+ missing", "mid": "1 missing", "low": "none missing"}, "cap": None, "if_unknown": "neutral"},
+                {"key": "hidden_experience", "name": "Underplayed experience", "weight": 25, "enabled": True, "description": "career notes", "anchors": {"high": "clear", "mid": "some", "low": "none"}, "cap": None, "if_unknown": "skip"},
+                {"key": "domain_shift", "name": "Domain shift", "weight": 15, "enabled": True, "description": "industry", "anchors": {"high": "different", "mid": "adjacent", "low": "same"}, "cap": None, "if_unknown": "neutral"}]}
+            self.tables["fit_rubric_versions"] = [{"id": "rv1", "version": 1, "job_stream_id": PM_STREAM, "rubric": rub},
+                                                  {"id": "rr1", "version": 1, "job_stream_id": PM_STREAM, "rubric": rrub}]
             self.tables["agent_prompt_versions"] = [
                 {"id": "pv-src", "version": 1, "system_template": DEFAULT_TEMPLATE["sourcer"]},
                 {"id": "pv-fit", "version": 1, "system_template": "You are a strict recruiter.\nParameters:\n{{rubric}}\nPark below {{threshold}}."},
@@ -2143,7 +2452,8 @@ class DrySupabase(Supabase):
             mk = lambda k, en=True, mode="every_run", pv=None, gr=None, mi=None: {"id": "ag-" + k, "key": k, "name": k, "enabled": en, "built_status": "live", "schedule": {"mode": mode},
                                                                               "model": {"primary": "gemini", "fallback": "groq"}, "active_prompt_version_id": pv, "guardrails": gr or [], "max_items": mi, "last_run_at": None}
             self.tables["agents"] = [mk("sourcer", pv="pv-src", mi=25), mk("fit", pv="pv-fit", mi=4, gr=[{"key": "max_calls", "on": True, "value": 6}, {"key": "require_basis", "on": True}]),
-                                     mk("notifier"), mk("jd_fetcher", mi=20), mk("status_sync", mode="nightly", pv="pv-st", gr=[{"key": "min_confidence", "on": True, "value": 0.7}]), mk("sweeps", mode="nightly")]
+                                     mk("notifier"), mk("jd_fetcher", mi=20), dict(mk("resume_decider", mi=10, gr=[{"key": "low_confidence_ask", "on": True, "value": 8}, {"key": "max_attempts", "locked": True, "value": 3}]), model={"primary": "jev", "fallback": "gemini"}),
+                                     mk("status_sync", mode="nightly", pv="pv-st", gr=[{"key": "min_confidence", "on": True, "value": 0.7}]), mk("sweeps", mode="nightly")]
             self.tables["agent_evals"] = [{"id": "ev1", "agent_id": "ag-fit", "job_stream_id": PM_STREAM, "is_active": True, "expected_band": "strong", "expected_min": 80, "expected_max": 100,
                                            "input": {"title": "Senior Product Manager", "company": "Acme", "location": "Chennai"}},
                                           {"id": "ev2", "agent_id": "ag-fit", "job_stream_id": PM_STREAM, "is_active": True, "expected_band": "no", "expected_min": 0, "expected_max": 39,
