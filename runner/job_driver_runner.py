@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0.11 · 17 Oct 2026 · v1.0.11: Jev (TypeSafe, via Vercel AI Gateway, secret AI_GATEWAY_API_KEY) as the judge for the new Resume Decider (picklist generic / tailored / not_run / failed on leads; per-stream criteria from the Agents screen; Jev scores each criterion, code applies weights and threshold; Gemini/Groq as backup; low-confidence flag; Failed after 3 tries) and as a shadow fit scorer (leads.fit_shadow, never used for decisions until it passes the eval gate). v1.0.10: fit replies are normalised before the format check (a bare list of scores, a single score object, or scores under "results"/"jobs" are accepted), and a reply that still fails is logged with its first 200 characters. v1.0.9: JD Fetcher (v1.0.8) merged with the agents config. Reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. The JD Fetcher has its own agent row (on/off, max pages per run); JD re-scoring uses the rubric; fit batch defaults to 4. Falls back to built-in behaviour if the agents table cannot be read. v1.0.8: JD Fetcher. Every live lead gets its full job description (LinkedIn public job page, no login; else the company's own apply/careers page via JSON-LD or page text) saved in leads.jd_text before Fit runs, and Fit now scores against the JD (batches of 4). Earlier leads and open applications without a JD are filled in later runs (max 3 tries each, then jd_confidence=fetch_failed). Leads already scored get re-scored once their JD lands. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
+# Job Application Driver · permanent runner · v1.0.12 · 17 Oct 2026 · v1.0.12: Resume Decider no longer spends a lead's 3 tries on outages (Jev 402/403 no credits, Gemini/Groq 429/503, no model left); it stops for the run, leaves the lead "not yet run" with the reason, and retries next pass. After the first Jev "no credits" reply, Jev is skipped for the rest of the run. v1.0.11: Jev (TypeSafe, via Vercel AI Gateway, secret AI_GATEWAY_API_KEY) as the judge for the new Resume Decider (picklist generic / tailored / not_run / failed on leads; per-stream criteria from the Agents screen; Jev scores each criterion, code applies weights and threshold; Gemini/Groq as backup; low-confidence flag; Failed after 3 tries) and as a shadow fit scorer (leads.fit_shadow, never used for decisions until it passes the eval gate). v1.0.10: fit replies are normalised before the format check (a bare list of scores, a single score object, or scores under "results"/"jobs" are accepted), and a reply that still fails is logged with its first 200 characters. v1.0.9: JD Fetcher (v1.0.8) merged with the agents config. Reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. The JD Fetcher has its own agent row (on/off, max pages per run); JD re-scoring uses the rubric; fit batch defaults to 4. Falls back to built-in behaviour if the agents table cannot be read. v1.0.8: JD Fetcher. Every live lead gets its full job description (LinkedIn public job page, no login; else the company's own apply/careers page via JSON-LD or page text) saved in leads.jd_text before Fit runs, and Fit now scores against the JD (batches of 4). Earlier leads and open applications without a JD are filled in later runs (max 3 tries each, then jd_confidence=fetch_failed). Leads already scored get re-scored once their JD lands. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone, date
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.11"
+VERSION = "1.0.12"
 IST = ZoneInfo("Asia/Kolkata")
 OWNER_ID = os.environ.get("OWNER_ID", "f0c721b5-e317-49c4-b02c-d7822411fa55")  # sudharsan454@gmail.com auth user
 PM_STREAM = "11111111-1111-4111-8111-000000000001"
@@ -1841,6 +1841,7 @@ def sweeps(sb, settings, run):
 # "is there enough information to judge it?". The weighting, if-unknown rule and caps stay in compute_fit, same as the Gemini path.
 JEV_URL = "https://ai-gateway.vercel.sh/v1/evaluate"
 JEV_JD_CHARS, JEV_RESUME_CHARS, JEV_NOTES_CHARS = 12000, 9000, 6000   # Vercel caps Jev at 32K tokens per request
+OUTAGE_RE = re.compile(r"(jev 40[23]|free tier users|insufficient|no AI model available|no AI_GATEWAY|\b429\b|\b503\b|high demand|limit|max AI calls|timed? ?out)", re.I)
 RESUME_SYS = "DECIDE_RESUME. You decide how much a candidate's generic resume needs tailoring for one job. JSON only."
 
 
@@ -1953,7 +1954,7 @@ def fit_shadow(sb, jev, run, limit=20):
             ans = jev.evaluate(jev_state(l, s, resume_for(s, docs)), jev_rubric_questions(rub))
         except Exception as e:
             run.errors.append({"stage": "fit_shadow", "lead": l["id"], "error": str(e)[:240]})
-            if jev.errors >= 3:
+            if jev.errors >= 3 or re.search(r"jev 40[23]|free tier users|insufficient", str(e), re.I):
                 break
             continue
         params = jev_param_scores(rub, ans)
@@ -2029,6 +2030,8 @@ def resume_decider(sb, llm, agents, settings, run):
                     if eng == "jev":
                         if not jev:
                             raise RuntimeError("no AI_GATEWAY_API_KEY secret")
+                        if getattr(jev, "blocked", None):
+                            raise RuntimeError(jev.blocked)
                         qs = jev_rubric_questions(rub)
                         qs["direct"] = {"type": "choice", "instructions": "Should the candidate send the generic resume as it is, or tailor it for this job?",
                                         "criteria": {"generic": "the generic resume already fits this job well enough", "tailored": "the resume should be rewritten to fit this job"}}
@@ -2055,6 +2058,8 @@ def resume_decider(sb, llm, agents, settings, run):
                     break
                 except Exception as e:
                     last_err = e
+                    if eng == "jev" and jev and re.search(r"jev 40[23]|free tier users|insufficient", str(e), re.I):
+                        jev.blocked = "jev unavailable this run: " + str(e)[:160]
                     log(f"resume decider: {eng} failed ({str(e)[:100]}); trying the next engine")
             if params is None:
                 raise last_err or RuntimeError("no engine available")
@@ -2073,6 +2078,12 @@ def resume_decider(sb, llm, agents, settings, run):
                 "resume_breakdown": {"params": params, "threshold": thr, "direct": direct, "rubric_version": rv.get("version"), "career_notes": bool(notes.strip())}})
             n += 1
         except Exception as e:
+            if OUTAGE_RE.search(str(e)):
+                # an outage, not this lead's fault: keep its tries, note why, stop for this run
+                sb.update("leads", {"id": l["id"]}, {"resume_error": ("waiting: " + str(e))[:300]})
+                run.errors.append({"stage": "resume_decider", "lead": l["id"], "outage": True, "error": str(e)[:240]})
+                run.notes.append(f"resume decider: stopped, no engine available ({str(e)[:100]}); {len(leads) - n} left for the next pass")
+                break
             patch = {"resume_attempts": attempts, "resume_error": str(e)[:300]}
             if attempts >= max_tries:
                 patch["resume_decision"] = "failed"
@@ -2099,7 +2110,7 @@ def jev_cycle(sb, llm, settings, agents):
     else:
         log(f"resume decider: {why_r}")
         mark(sb, agents, "resume_decider", False, "skipped: " + why_r)
-    if jev:
+    if jev and not getattr(jev, "blocked", None):
         r = Run(sb, "fit_shadow", "jev")
         try:
             fit_shadow(sb, jev, r)
