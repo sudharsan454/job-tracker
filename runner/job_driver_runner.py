@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0.9 · 17 Oct 2026 · v1.0.9: JD Fetcher (v1.0.8) merged with the agents config. Reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. The JD Fetcher has its own agent row (on/off, max pages per run); JD re-scoring uses the rubric; fit batch defaults to 4. Falls back to built-in behaviour if the agents table cannot be read. v1.0.8: JD Fetcher. Every live lead gets its full job description (LinkedIn public job page, no login; else the company's own apply/careers page via JSON-LD or page text) saved in leads.jd_text before Fit runs, and Fit now scores against the JD (batches of 4). Earlier leads and open applications without a JD are filled in later runs (max 3 tries each, then jd_confidence=fetch_failed). Leads already scored get re-scored once their JD lands. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
+# Job Application Driver · permanent runner · v1.0.10 · 17 Oct 2026 · v1.0.10: fit replies are normalised before the format check (a bare list of scores, a single score object, or scores under "results"/"jobs" are accepted), and a reply that still fails is logged with its first 200 characters. v1.0.9: JD Fetcher (v1.0.8) merged with the agents config. Reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. The JD Fetcher has its own agent row (on/off, max pages per run); JD re-scoring uses the rubric; fit batch defaults to 4. Falls back to built-in behaviour if the agents table cannot be read. v1.0.8: JD Fetcher. Every live lead gets its full job description (LinkedIn public job page, no login; else the company's own apply/careers page via JSON-LD or page text) saved in leads.jd_text before Fit runs, and Fit now scores against the JD (batches of 4). Earlier leads and open applications without a JD are filled in later runs (max 3 tries each, then jd_confidence=fetch_failed). Leads already scored get re-scored once their JD lands. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone, date
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.9"
+VERSION = "1.0.10"
 IST = ZoneInfo("Asia/Kolkata")
 OWNER_ID = os.environ.get("OWNER_ID", "f0c721b5-e317-49c4-b02c-d7822411fa55")  # sudharsan454@gmail.com auth user
 PM_STREAM = "11111111-1111-4111-8111-000000000001"
@@ -951,16 +951,32 @@ class TokenSum:
         self.tokens_out = sum(l.tokens_out for l in llms)
 
 
-def llm_json_checked(llm, system, user, ok):
-    """Guardrail 'Fixed output format': one retry when the reply does not have the expected shape."""
+def llm_json_checked(llm, system, user, ok, norm=None):
+    """Guardrail 'Fixed output format': normalise known near-misses, then one retry when the reply still has the wrong shape."""
     out = llm.json(system, user)
+    out = norm(out) if norm else out
     if ok(out):
         return out
-    log("reply did not match the output format; retrying once")
+    log(f"reply did not match the output format; retrying once: {str(out)[:200]}")
     out = llm.json(system, user)
+    out = norm(out) if norm else out
     if ok(out):
         return out
-    raise RuntimeError("reply did not match the output format twice")
+    raise RuntimeError("reply did not match the output format twice; last reply: " + str(out)[:200])
+
+
+def fit_norm(o):
+    if isinstance(o, list):
+        return {"scores": o}
+    if isinstance(o, dict) and not isinstance(o.get("scores"), list):
+        for k in ("results", "jobs", "items", "data"):
+            if isinstance(o.get(k), list):
+                return {"scores": o[k]}
+        if "index" in o and ("params" in o or "fit_score" in o):
+            return {"scores": [o]}
+        if isinstance(o.get("scores"), dict):
+            return {"scores": [o["scores"]]}
+    return o
 
 
 def fit_ok(out):
@@ -1032,7 +1048,7 @@ def score_items(llm, agents, stream, resume, items, rubric, run, stage):
             run.notes.append(f"{stage} {stream['name']}: {'max AI calls reached' if getattr(llm, 'capped', False) else 'AI limit hit'}, {len(items) - i} left for later")
             break
         try:
-            out = llm_json_checked(llm, system, json.dumps(fit_payload(stream, resume, batch)), fit_ok)
+            out = llm_json_checked(llm, system, json.dumps(fit_payload(stream, resume, batch)), fit_ok, fit_norm)
         except Exception as e:
             run.errors.append({"stage": stage, "stream": stream["name"], "error": str(e)[:300]})
             continue
