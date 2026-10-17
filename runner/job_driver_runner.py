@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0.8 · 17 Oct 2026 · v1.0.8: JD Fetcher. Every live lead gets its full job description (LinkedIn public job page, no login; else the company's own apply/careers page via JSON-LD or page text) saved in leads.jd_text before Fit runs, and Fit now scores against the JD (batches of 4). Earlier leads and open applications without a JD are filled in later runs (max 3 tries each, then jd_confidence=fetch_failed). Leads already scored get re-scored once their JD lands. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
+# Job Application Driver · permanent runner · v1.0.8 · 17 Oct 2026 · v1.0.8: reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. Falls back to the v1.0.7 behaviour if the agents table cannot be read. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -12,7 +12,7 @@
 #   SUPABASE_URL, SUPABASE_SERVICE_KEY. Optional: GEMINI_MODEL (default auto = newest free Flash model), OWNER_ID.
 # Design doc: PMOS/JobTracker/job-application-driver-design-v1.7.html (sections 8, 11, 12).
 
-import argparse, email, email.policy, email.utils, hashlib, html, imaplib, json, os, re, sys, time, traceback, urllib.error, urllib.parse, urllib.request
+import argparse, math, email, email.policy, email.utils, hashlib, html, imaplib, json, os, re, sys, time, traceback, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone, date
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
@@ -28,13 +28,6 @@ OPEN_STATUSES = ["applied", "screening", "round_1", "round_2", "round_3", "offer
 MAX_MAILS_PER_RUN = 25       # Gemini free tier is rate-limited; the rest carry over to the next run
 EXTRACT_BUDGET_S = 300       # stop reading mails after 5 min so push + replies always run inside the job
 MAX_MAIL_TRIES = 3           # a mail that keeps failing is dropped after 3 runs (logged with its message id)
-JD_MAX_PER_RUN = 20          # job pages fetched per run (new leads + backlog)
-JD_BUDGET_S = 180            # time budget for JD fetching per run
-JD_PAUSE_S = 4               # pause between LinkedIn page fetches
-JD_MAX_TRIES = 3             # a JD that keeps failing is marked fetch_failed after 3 runs
-JD_STORE_MAX = 30000         # max chars stored per JD
-JD_FOR_FIT = 3500            # JD chars sent to the fit model per job
-FIT_BATCH = 4                # jobs per fit call (smaller now that full JDs go in)
 NIGHTLY_AT = "21:36"         # IST; nightly work runs in the first run at or after this time each day
 
 
@@ -190,15 +183,16 @@ class Gemini:
             return self._call(model, system, user, max_tokens, timeout, thinking=False)
         return st, d
 
-    def json(self, system, user, max_tokens=4096):
+    def json(self, system, user, max_tokens=4096, model=None, timeout=75):
         if self.dry:
             return FakeLLM.answer(system, user)
         if self.gave_up_429:
             raise RuntimeError("gemini 429 (limit): paused, not calling again this run")
-        if self.model in ("", "auto", None):
+        if not model and self.model in ("", "auto", None):
             self.discover()
         for attempt in range(3):
-            st, d = self._call(self.model, system, user, max_tokens)
+            use = model or self.model
+            st, d = self._call(use, system, user, max_tokens, timeout=timeout or 75)
             if st == 200:
                 um = d.get("usageMetadata", {})
                 self.tokens_in += um.get("promptTokenCount", 0)
@@ -209,11 +203,17 @@ class Gemini:
                 except Exception as e:
                     raise RuntimeError(f"gemini bad json: {e} {str(d)[:300]}")
             if st == 404 and attempt == 0:
+                if model:
+                    log(f"gemini {model} (set in the app) 404; using the auto-picked model")
+                    model = None
+                    if self.model in ("", "auto", None):
+                        self.discover()
+                    continue
                 log(f"gemini {self.model} 404; re-discovering")
                 self.discover()
                 continue
             if st == 599:
-                raise RuntimeError(f"gemini timeout on {self.model}: {str(d)[:120]}")
+                raise RuntimeError(f"gemini timeout on {use}: {str(d)[:120]}")
             if st in (429, 500, 503) and attempt < 2:
                 wait = 20 * (attempt + 1)
                 log(f"gemini {st}, retry in {wait}s")
@@ -248,20 +248,20 @@ class Groq:
                 return hit
         raise RuntimeError("groq: no preferred model in " + ", ".join(ids[:15]))
 
-    def json(self, system, user, max_tokens=4096):
+    def json(self, system, user, max_tokens=4096, model=None, timeout=75):
         if self.gave_up_429:
             raise RuntimeError("groq 429 (limit): paused this run")
-        if not self.model:
+        if not model and not self.model:
             self.pick_model()
-        body = {"model": self.model, "temperature": 0.1, "max_completion_tokens": max_tokens,
+        body = {"model": model or self.model, "temperature": 0.1, "max_completion_tokens": max_tokens,
                 "response_format": {"type": "json_object"},
                 "messages": [{"role": "system", "content": system + "\nReply with one JSON object only."}, {"role": "user", "content": user[:24000]}]}
-        if "gpt-oss" in self.model:
+        if "gpt-oss" in body["model"]:
             body["reasoning_effort"] = "low"
         for attempt in range(2):
             self.calls += 1
             try:
-                st, d = http("POST", "https://api.groq.com/openai/v1/chat/completions", body, headers=self.h, timeout=75)
+                st, d = http("POST", "https://api.groq.com/openai/v1/chat/completions", body, headers=self.h, timeout=timeout or 75)
             except Exception as e:
                 raise RuntimeError(f"groq timeout: {str(e)[:120]}")
             if st == 400 and "reasoning_effort" in body:
@@ -304,7 +304,7 @@ class LLM:
     def tokens_out(self):
         return self.gem.tokens_out + (self.groq.tokens_out if self.groq else 0)
 
-    def json(self, system, user, max_tokens=4096):
+    def json(self, system, user, max_tokens=4096, **kw):
         err = None
         if not self.gem.gave_up_429:
             try:
@@ -331,6 +331,11 @@ class FakeLLM:
                 jobs.append({"title": m.group(1), "company": m.group(2), "location": m.group(3), "url": m.group(4),
                              "easy_apply": "easy" in m.group(4), "posted_text": "1 day ago", "snippet": "fixture", "stream": "Product management"})
             return {"is_job_alert": bool(jobs), "jobs": jobs}
+        if "SCORE_FIT" in system and re.search(r'\(key "[a-z0-9_]+"', system):
+            n = user.count('"title"')
+            keys = re.findall(r'\(key "([a-z0-9_]+)"', system)
+            return {"scores": [{"index": i, "params": {k: {"score": (None if k == "must_haves" else max(5, 88 - 14 * i - 3 * j)), "why": "fixture"} for j, k in enumerate(keys)},
+                                "basis": "title_only", "note": "dry run score"} for i in range(n)]}
         if "SCORE_FIT" in system:
             n = user.count('"title"')
             return {"scores": [{"index": i, "fit_score": 72 - 9 * i, "fit_breakdown": {"basis": "fixture", "role_level": "PM", "domain": "SaaS",
@@ -403,155 +408,6 @@ def html_to_text(s):
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n\s*\n+", "\n", t)
     return t.strip()
-
-
-# ---------------------------------------------------------------- JD Fetcher (v1.0.8)
-BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-JD_WORDS = re.compile(r"responsib|requirement|qualification|experience|what you|about the role|you will|skills", re.I)
-
-
-def http_text(url, timeout=25):
-    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA, "Accept": "text/html,application/xhtml+xml",
-                                               "Accept-Language": "en-US,en;q=0.9"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            body = r.read(3_000_000).decode(r.headers.get_content_charset() or "utf-8", errors="replace")
-            return r.status, body, r.geturl()
-    except urllib.error.HTTPError as e:
-        return e.code, "", url
-    except Exception as e:
-        return 0, str(e)[:200], url
-
-
-def jsonld_jobposting(body):
-    """Most ATS pages (Greenhouse, Lever, Workday, Ashby, SmartRecruiters) embed a schema.org JobPosting."""
-    for blob in re.findall(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', body, re.S | re.I):
-        try:
-            data = json.loads(blob.strip())
-        except Exception:
-            continue
-        stack = [data]
-        while stack:
-            d = stack.pop()
-            if isinstance(d, list):
-                stack.extend(d)
-            elif isinstance(d, dict):
-                t = d.get("@type")
-                if (t == "JobPosting" or (isinstance(t, list) and "JobPosting" in t)) and d.get("description"):
-                    return d
-                stack.extend(v for v in d.values() if isinstance(v, (list, dict)))
-    return None
-
-
-def generic_jd(url):
-    st, body, final = http_text(url)
-    if st != 200 or not body:
-        return {"error": f"page HTTP {st}"}
-    jp = jsonld_jobposting(body)
-    if jp:
-        txt = html_to_text(jp["description"]) if "<" in jp["description"] else html.unescape(jp["description"])
-        head = [f"Source: {final}"]
-        if jp.get("title"):
-            head.append(f"Title: {jp['title']}")
-        if jp.get("employmentType"):
-            head.append(f"Employment type: {jp['employmentType']}")
-        if len(txt) >= 300:
-            return {"text": "\n".join(head) + "\n\n" + txt, "source_url": final, "confidence": "full" if len(txt) >= 800 else "partial"}
-    body = re.sub(r"<(nav|header|footer|aside|form)\b.*?</\1>", " ", body, flags=re.S | re.I)
-    txt = html_to_text(body)
-    if len(txt) >= 800 and len(JD_WORDS.findall(txt)) >= 2:
-        return {"text": f"Source: {final}\n(page text, not a structured job description)\n\n" + txt[:15000], "source_url": final, "confidence": "partial"}
-    return {"error": "no job description found on page"}
-
-
-def li_job_id(url):
-    m = re.search(r"linkedin\.com/(?:comm/)?jobs/view/(?:[^/?#]*?-)?(\d{6,})", url or "") or re.search(r"currentJobId=(\d{6,})", url or "")
-    return m.group(1) if m else None
-
-
-def linkedin_jd(jid, state):
-    if state.get("li_blocked", 0) >= 2:
-        return {"error": "linkedin blocked this run"}
-    st, body, _ = http_text(f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{jid}")
-    time.sleep(JD_PAUSE_S)
-    if st in (429, 999, 403):
-        state["li_blocked"] = state.get("li_blocked", 0) + 1
-        return {"error": f"linkedin HTTP {st} (blocked/rate limited)"}
-    if st != 200 or not body:
-        return {"error": f"linkedin HTTP {st}"}
-    m = re.search(r'class="show-more-less-html__markup[^"]*"[^>]*>(.*?)</div>\s*(?:<button|</section>)', body, re.S) \
-        or re.search(r'class="description__text[^"]*"[^>]*>(.*?)</section>', body, re.S)
-    desc = html_to_text(m.group(1)) if m else ""
-    head = [f"Source: LinkedIn job {jid}"]
-    for k, v in re.findall(r'description__job-criteria-subheader[^>]*>\s*(.*?)\s*</h3>\s*<span[^>]*>\s*(.*?)\s*</span>', body, re.S):
-        head.append(f"{html.unescape(k).strip()}: {html.unescape(v).strip()}")
-    if re.search(r"No longer accepting applications", body, re.I):
-        head.append("Posting status: no longer accepting applications")
-    offsite = None
-    a = re.search(r'<code id="applyUrl"[^>]*><!--"(.*?)"--></code>', body, re.S)
-    if a:
-        q = urllib.parse.parse_qs(urllib.parse.urlparse(html.unescape(a.group(1))).query)
-        offsite = (q.get("url") or [None])[0]
-    if offsite:
-        head.append(f"Company apply link: {offsite}")
-    return {"desc": desc, "head": head, "offsite": offsite}
-
-
-def fetch_jd(url, state):
-    """Returns {"text","source_url","confidence"} or {"error"}. LinkedIn public page first, then the company page."""
-    if not url:
-        return {"error": "no url"}
-    jid = li_job_id(url)
-    if not jid:
-        return generic_jd(url)
-    li = linkedin_jd(jid, state)
-    if li.get("error"):
-        return li
-    li_url = f"https://www.linkedin.com/jobs/view/{jid}/"
-    if len(li["desc"]) >= 600:
-        return {"text": "\n".join(li["head"]) + "\n\n" + li["desc"], "source_url": li_url, "confidence": "full"}
-    if li.get("offsite"):
-        g = generic_jd(li["offsite"])
-        if not g.get("error") and len(g["text"]) > len(li["desc"]):
-            g["text"] = "\n".join(li["head"]) + "\n\n" + g["text"]
-            return g
-    if li["desc"]:
-        return {"text": "\n".join(li["head"]) + "\n\n" + li["desc"], "source_url": li_url, "confidence": "partial"}
-    return {"error": "linkedin page had no description"}
-
-
-class JDBudget:
-    def __init__(self, dry=False):
-        self.start, self.n, self.dry, self.state = time.time(), 0, dry, {}
-        self.ok = self.failed = 0
-
-    def left(self):
-        return self.n < JD_MAX_PER_RUN and time.time() - self.start < JD_BUDGET_S
-
-    def fetch(self, url, title=""):
-        self.n += 1
-        if self.dry:
-            r = {"text": f"Source: dry run\n\nAbout the role: {title}. Responsibilities: own the roadmap. Requirements: 6+ years PM experience.",
-                 "source_url": url, "confidence": "full"}
-        else:
-            try:
-                r = fetch_jd(url, self.state)
-            except Exception as e:
-                r = {"error": f"fetch crashed: {str(e)[:150]}"}
-        if r.get("error"):
-            self.failed += 1
-        else:
-            self.ok += 1
-            r["text"] = r["text"][:JD_STORE_MAX]
-        return r
-
-
-def jd_payload(l):
-    jd = (l.get("jd_text") or "").strip()
-    job = {"title": l["title"], "company": l["company"], "location": l.get("location"), "snippet": l.get("raw_snippet")}
-    if jd:
-        job["jd"] = jd[:JD_FOR_FIT]
-    return job
 
 
 def mail_text(msg):
@@ -652,13 +508,493 @@ Rules: one entry per distinct job in the mail; use the job's own link (not unsub
 Assign "stream" by matching the job against each stream's target titles and goal; null if neither fits."""
 
 FIT_SYS = """SCORE_FIT. You are a strict recruiter screening jobs for one candidate. JSON only.
-Input: the candidate's resume, the job stream goal, and a list of jobs (index, title, company, location, snippet, and "jd" = the full job description when we have it). When "jd" is present, score against its real must-haves (years, domain, skills, level) and start "basis" with "full JD"; when it is missing, start "basis" with "title only".
+Input: the candidate's resume, the job stream goal, and a list of jobs (index, title, company, location, snippet). Usually only title/company/location are known, so say so in "basis".
 Return {"scores":[{"index":int,"fit_score":0-100,"fit_breakdown":{"basis":str,"role_level":str,"domain":str,"location":str,"must_haves":str,"note":str}}]}.
 Scoring: 80+ only when title, seniority and domain all match the stream; 60-79 plausible, worth a look; 40-59 stretch or domain shift; <40 wrong level, wrong function or clearly junior/senior-mismatch. Location outside the stream's cities and not remote: cap at 50. Keep every string under 120 chars."""
 
 STATUS_SYS = """CLASSIFY_STATUS. You read one email about a job application and return JSON only.
 Return {"outcome": one of ["rejected","interview_invite","offer","assessment","acknowledgement","other"], "company": str, "verbatim": the exact sentences that state the decision (copy, do not paraphrase; empty if none), "confidence": 0-1}.
 "rejected" only when the mail clearly says the candidate is not moving forward for this application."""
+
+
+# ---------------------------------------------------------------- Agents config (v1.0.8): read from public.agents on every pass
+# The web app's Agents screen writes these rows. render_rubric / render_system / compute_fit MUST stay identical
+# to agRubricText / agRenderSystem / agComputeFit in jobs/index.html (app v1.0.5+), so the preview there is what is sent here.
+DEFAULT_PHASE = {"sourcer": "cycle", "fit": "cycle", "notifier": "cycle", "status_sync": "nightly", "sweeps": "nightly"}
+MARK = {"fit": "SCORE_FIT.", "sourcer": "EXTRACT_JOBS.", "status_sync": "CLASSIFY_STATUS."}
+OUT_FORMAT = {
+    "fit": 'Output format (fixed by the system): JSON only, no prose.\n{"scores":[{"index":<int>,"params":{"<parameter key>":{"score":<0-100 or null>,"why":"<under 120 chars>"}},"basis":"title_only | snippet | jd","note":"<under 120 chars>"}]}\nOne entry per job. Include every parameter key listed above.',
+    "sourcer": 'Output format (fixed by the system): JSON only.\n{"is_job_alert": true|false, "jobs": [{"title","company","location","url","easy_apply": true|false|null,"posted_text": "as written, e.g. 2 days ago, or null","snippet": "<=200 chars","stream": "one of the stream names, or null"}]}',
+    "status_sync": 'Output format (fixed by the system): JSON only.\n{"outcome": "rejected|interview_invite|offer|assessment|acknowledgement|other", "company": "<name>", "verbatim": "<exact sentences, or empty>", "confidence": <0-1>}',
+}
+DEFAULT_TEMPLATE = {  # used only when the agents table cannot be read (same text as prompt v1 in the database)
+    "sourcer": ("You read one job-alert email and pull out every concrete job opening in it.\n"
+                "Rules: one entry per distinct job in the mail; use the job's own link (not unsubscribe or profile links); if the mail is a newsletter, profile nag, course ad or recruiter marketing with no concrete openings, set is_job_alert to false and return no jobs.\n"
+                "Assign \"stream\" by matching the job against each stream's target titles and goal; null if neither fits.\nStreams:\n{{streams}}"),
+    "status_sync": ("You read one email about a job application and decide what it says about that application.\n"
+                    "\"rejected\" only when the mail clearly says the candidate is not moving forward for this application.\n"
+                    "For \"verbatim\", copy the exact sentences that state the decision; do not paraphrase. Leave it empty if there are none."),
+}
+BANDS = {"strong": (80, 100, True), "plausible": (60, 79, True), "stretch": (40, 59, False), "no": (0, 39, False)}
+
+
+def render_rubric(rub):
+    lines = []
+    for p in (rub or {}).get("params") or []:
+        if p.get("enabled") is False:
+            continue
+        a = p.get("anchors") or {}
+        lines.append(f'- {p.get("name")} (key "{p.get("key")}", weight {p.get("weight")}): {p.get("description") or ""}')
+        lines.append(f'    about 90: {a.get("high") or ""}')
+        lines.append(f'    about 50: {a.get("mid") or ""}')
+        lines.append(f'    about 10: {a.get("low") or ""}')
+        cap = p.get("cap")
+        if cap and cap.get("below") is not None and cap.get("max") is not None:
+            lines.append(f'    Hard cap: if this is below {fmt_num(cap["below"])}, the total cannot be above {fmt_num(cap["max"])} (applied by the system).')
+        lines.append("    If you cannot judge it: return null." + (" It is then left out of the total." if p.get("if_unknown") == "skip" else " It is then scored 50."))
+    return "\n".join(lines)
+
+
+def fmt_num(v):
+    """Print numbers the way JavaScript's String() does (30 not 30.0), so the prompt matches the app preview."""
+    try:
+        f = float(v)
+        return str(int(f)) if f == int(f) else str(f)
+    except Exception:
+        return str(v)
+
+
+def streams_desc(streams):
+    return "\n".join(f'- "{s["name"]}": goal={s.get("goal") or ""}; target titles={", ".join(s.get("target_titles") or [])}' for s in streams)
+
+
+def render_system(key, template, rubric=None, streams=None):
+    body = template or ""
+    if key == "fit":
+        body = body.replace("{{rubric}}", render_rubric(rubric)).replace("{{threshold}}", fmt_num((rubric or {}).get("threshold", 60)))
+    if key == "sourcer":
+        body = body.replace("{{streams}}", streams_desc(streams or []))
+    return (MARK[key] + "\n" if key in MARK else "") + body + ("\n\n" + OUT_FORMAT[key] if key in OUT_FORMAT else "")
+
+
+def _score(v):
+    if isinstance(v, dict):
+        v = v.get("score")
+    if v is None or v == "" or isinstance(v, bool):
+        return None
+    try:
+        return max(0.0, min(100.0, float(v)))
+    except Exception:
+        return None
+
+
+def compute_fit(rub, params):
+    """Weighted mean of the parameter scores; null -> 50 (neutral) or left out (skip); then hard caps. Round half up like JS Math.round."""
+    tot = w = 0.0
+    caps = []
+    ps = [p for p in (rub or {}).get("params") or [] if p.get("enabled") is not False]
+    for p in ps:
+        s = _score((params or {}).get(p["key"]))
+        if s is None:
+            if p.get("if_unknown") == "skip":
+                continue
+            s = 50.0
+        tot += float(p.get("weight") or 0) * s
+        w += float(p.get("weight") or 0)
+    total = int(math.floor(tot / w + 0.5)) if w else None
+    for p in ps:
+        cap = p.get("cap")
+        if not cap or cap.get("below") is None or cap.get("max") is None:
+            continue
+        s = _score((params or {}).get(p["key"]))
+        if s is not None and s < float(cap["below"]) and total is not None and total > float(cap["max"]):
+            total = int(float(cap["max"]))
+            caps.append(p["key"])
+    return total, caps
+
+
+def guard(cfg, key):
+    for g in (cfg or {}).get("guardrails") or []:
+        if g.get("key") == key:
+            return g
+    return None
+
+
+def guard_on(cfg, key, default=True):
+    g = guard(cfg, key)
+    if g is None:
+        return default
+    return bool(g.get("locked") or g.get("on", True))
+
+
+def guard_value(cfg, key, default=None):
+    g = guard(cfg, key)
+    if g is None:
+        return default
+    if not (g.get("locked") or g.get("on", True)):
+        return None  # switched off in the app: no limit
+    return g.get("value", default)
+
+
+def load_agents(sb):
+    """{key: agents row + 'prompt' (active version row)}; {} when the table is missing or unreadable (then v1.0.7 behaviour)."""
+    try:
+        rows = sb.select("agents", {"owner_id": "eq." + OWNER_ID, "select": "*"})
+    except Exception as e:
+        log(f"agents config not readable ({str(e)[:120]}); using built-in settings")
+        return {}
+    ids = [r["active_prompt_version_id"] for r in rows if r.get("active_prompt_version_id")]
+    pvs = {}
+    if ids:
+        try:
+            pvs = {p["id"]: p for p in sb.select("agent_prompt_versions", {"id": "in.(" + ",".join(ids) + ")", "select": "id,version,system_template"})}
+        except Exception as e:
+            log(f"prompt versions not readable ({str(e)[:120]}); using built-in prompts")
+    out = {}
+    for r in rows:
+        r["prompt"] = pvs.get(r.get("active_prompt_version_id"))
+        out[r["key"]] = r
+    if out:
+        log("agents config: " + ", ".join(f'{k}={"on" if r.get("enabled") else "off"}/{(r.get("schedule") or {}).get("mode", "every_run")}'
+                                          f'{"/p" + str(r["prompt"]["version"]) if r.get("prompt") else ""}' for k, r in sorted(out.items())))
+    return out
+
+
+def load_rubrics(sb, streams, ids=None):
+    """{stream_id: {"id", "version", "rubric"}} for the active (or the given) fitment versions."""
+    want = ids or [s.get("fit_rubric_version_id") for s in streams if s.get("fit_rubric_version_id")]
+    want = [i for i in want if i]
+    if not want:
+        return {}
+    try:
+        rows = sb.select("fit_rubric_versions", {"id": "in.(" + ",".join(want) + ")", "select": "id,version,job_stream_id,rubric"})
+    except Exception as e:
+        log(f"fitment rubrics not readable ({str(e)[:120]}); using the legacy fit prompt")
+        return {}
+    return {r["job_stream_id"]: r for r in rows if r.get("id") in want}
+
+
+def template_for(agents, key):
+    p = (agents.get(key) or {}).get("prompt")
+    return p["system_template"] if p and p.get("system_template") else DEFAULT_TEMPLATE.get(key, "")
+
+
+def due(agents, key, phase):
+    """Should this agent run in this phase ('cycle' = every runner pass, 'nightly')? No row = built-in default."""
+    cfg = agents.get(key)
+    if not cfg:
+        return phase == DEFAULT_PHASE.get(key, "cycle"), "built-in default"
+    if cfg.get("built_status") == "not_built":
+        return False, "not built"
+    if not cfg.get("enabled"):
+        return False, "off"
+    sch = cfg.get("schedule") or {}
+    mode = sch.get("mode", "every_run")
+    if phase == "nightly":
+        return mode == "nightly", ("nightly" if mode == "nightly" else "not a nightly agent")
+    if mode == "every_run":
+        return True, "every pass"
+    if mode == "every_n_hours":
+        hrs = float(sch.get("hours") or 4)
+        last = cfg.get("last_run_at")
+        if not last:
+            return True, f"every {hrs:g} h (first run)"
+        try:
+            age_h = (now_utc() - datetime.fromisoformat(last.replace("Z", "+00:00"))).total_seconds() / 3600
+        except Exception:
+            return True, f"every {hrs:g} h"
+        # the runner wakes about every 2 h, so allow 30 min of drift
+        return (age_h >= hrs - 0.5), f"every {hrs:g} h (last {age_h:.1f} h ago)"
+    return False, "nightly only"
+
+
+def mark(sb, agents, key, ran, status):
+    cfg = agents.get(key)
+    if not cfg or sb.dry:
+        return
+    patch = {"last_run_status": f"{status} · {datetime.now(IST).strftime('%d %b %H:%M')} IST"}
+    if ran:
+        patch["last_run_at"] = iso(now_utc())
+    try:
+        sb.update("agents", {"id": cfg["id"]}, patch)
+    except Exception as e:
+        log(f"could not update agents.{key}: {str(e)[:120]}")
+
+
+class AgentLLM:
+    """One agent's view of the shared Gemini/Groq clients: model order from its row, its max-calls guardrail, its own token count.
+    The daily quota and the 429 pauses stay shared, because they belong to the account, not the agent."""
+    def __init__(self, base, cfg=None, max_calls_default=None):
+        self.base = base
+        m = (cfg or {}).get("model") or {}
+        self.order, self.skipped = [], []
+        for p in (m.get("primary") or "gemini", m.get("fallback") or "groq"):
+            if p in (None, "none") or p in self.order:
+                continue
+            if p == "ollama":
+                self.skipped.append("ollama (not reachable from GitHub)")
+                continue
+            if p in ("gemini", "groq"):
+                self.order.append(p)
+        if not self.order:
+            self.order = ["gemini", "groq"]
+        mc = guard_value(cfg, "max_calls", max_calls_default) if cfg else max_calls_default
+        self.max_calls = int(mc) if mc is not None else None
+        self.max_tokens = int(m.get("max_tokens") or 4096)
+        self.timeout = int(m.get("timeout_s") or 75)
+        self.overrides = {"gemini": m.get("gemini_model") or None, "groq": m.get("groq_model") or None}
+        self.calls = 0
+        self.tokens_in = self.tokens_out = 0
+        self.used = []
+
+    def _prov(self, p):
+        return self.base.gem if p == "gemini" else self.base.groq
+
+    @property
+    def capped(self):
+        return self.max_calls is not None and self.calls >= self.max_calls
+
+    @property
+    def gave_up_429(self):
+        return self.capped or all(self._prov(p) is None or self._prov(p).gave_up_429 for p in self.order)
+
+    @property
+    def label(self):
+        return ",".join(dict.fromkeys(self.used)) or "-"
+
+    def json(self, system, user, max_tokens=None):
+        if self.capped:
+            raise RuntimeError(f"max AI calls per run reached ({self.max_calls})")
+        err = None
+        for p in self.order:
+            prov = self._prov(p)
+            if prov is None or prov.gave_up_429:
+                continue
+            ti, to = prov.tokens_in, prov.tokens_out
+            self.calls += 1
+            try:
+                out = prov.json(system, user, max_tokens or self.max_tokens, model=self.overrides.get(p), timeout=self.timeout)
+            except Exception as e:
+                err = e
+                log(f"{p} failed ({str(e)[:80]}); trying the next model")
+                continue
+            finally:
+                self.tokens_in += prov.tokens_in - ti
+                self.tokens_out += prov.tokens_out - to
+            if p == "groq":
+                self.base.used_groq += 1
+            self.used.append(p)
+            return out
+        raise err or RuntimeError("no AI model available this run (limits hit or none set)")
+
+
+class TokenSum:
+    def __init__(self, *llms):
+        self.tokens_in = sum(l.tokens_in for l in llms)
+        self.tokens_out = sum(l.tokens_out for l in llms)
+
+
+def llm_json_checked(llm, system, user, ok):
+    """Guardrail 'Fixed output format': one retry when the reply does not have the expected shape."""
+    out = llm.json(system, user)
+    if ok(out):
+        return out
+    log("reply did not match the output format; retrying once")
+    out = llm.json(system, user)
+    if ok(out):
+        return out
+    raise RuntimeError("reply did not match the output format twice")
+
+
+def fit_ok(out):
+    return isinstance(out, dict) and isinstance(out.get("scores"), list)
+
+
+def fit_results(out, rubric, n, meta):
+    """{index: (fit_score, fit_breakdown)}. With a rubric the model only scores parameters; the total and caps are computed here."""
+    res = {}
+    for sc in (out or {}).get("scores") or []:
+        try:
+            i = int(sc.get("index"))
+        except Exception:
+            continue
+        if not 0 <= i < n:
+            continue
+        if rubric:
+            raw = sc.get("params") or {}
+            clean = {}
+            for p in rubric.get("params") or []:
+                if p.get("enabled") is False:
+                    continue
+                v = raw.get(p["key"])
+                why = v.get("why") if isinstance(v, dict) else ""
+                s = _score(v)
+                clean[p["key"]] = {"score": (int(round(s)) if s is not None else None), "why": str(why or "")[:160]}
+            total, caps = compute_fit(rubric, clean)
+            res[i] = (total, {"basis": str(sc.get("basis") or "")[:40], "note": str(sc.get("note") or "")[:200], "params": clean, "caps_applied": caps, **meta})
+        else:
+            res[i] = (sc.get("fit_score"), sc.get("fit_breakdown"))
+    return res
+
+
+def fit_payload(stream, resume, items):
+    return {"stream_goal": stream.get("goal"), "stream_locations": stream.get("locations"), "resume": (resume or "")[:9000],
+            "jobs": [{"index": k, "title": x.get("title"), "company": x.get("company"), "location": x.get("location"), "snippet": x.get("snippet") or x.get("raw_snippet"),
+                      "jd": ((x.get("jd_text") or "")[:3000] or None)} for k, x in enumerate(items)]}
+
+
+def fit_system(agents, rubric):
+    """System prompt for one stream: rubric prompt when the stream has an active rubric, else the v1.0.7 prompt."""
+    if rubric:
+        return render_system("fit", template_for(agents, "fit") or "{{rubric}}", rubric=rubric)
+    return FIT_SYS
+
+
+def stream_threshold(rubrics, settings, sid):
+    r = rubrics.get(sid)
+    if r and (r.get("rubric") or {}).get("threshold") is not None:
+        return float(r["rubric"]["threshold"])
+    return float(settings.get("fit_threshold", 60))
+
+
+def resume_for(stream, docs):
+    return (docs.get(stream.get("generic_document_id")) or {}).get("text") or next((d["text"] for d in docs.values() if d["job_stream_id"] == stream["id"]), "")
+
+
+def score_items(llm, agents, stream, resume, items, rubric, run, stage):
+    """Score a list of dicts (leads or eval inputs) for one stream in batches. Returns {position: (score, breakdown)}."""
+    cfg = agents.get("fit")
+    batch_n = max(1, int((cfg or {}).get("max_items") or 8))
+    meta = {"prompt_version": ((cfg or {}).get("prompt") or {}).get("version"), "rubric_version": (rubric or {}).get("version")}
+    rub = (rubric or {}).get("rubric")
+    system = fit_system(agents, rub)
+    out_all = {}
+    for i in range(0, len(items), batch_n):
+        batch = items[i:i + batch_n]
+        if llm.gave_up_429:
+            run.notes.append(f"{stage} {stream['name']}: {'max AI calls reached' if getattr(llm, 'capped', False) else 'AI limit hit'}, {len(items) - i} left for later")
+            break
+        try:
+            out = llm_json_checked(llm, system, json.dumps(fit_payload(stream, resume, batch)), fit_ok)
+        except Exception as e:
+            run.errors.append({"stage": stage, "stream": stream["name"], "error": str(e)[:300]})
+            continue
+        res = fit_results(out, rub, len(batch), {**meta, "model": llm.label if hasattr(llm, "label") else None})
+        for k, (score, fb) in res.items():
+            if rub and guard_on(cfg, "require_basis", True) and not (fb or {}).get("basis"):
+                run.errors.append({"stage": stage, "guardrail": "require_basis", "title": batch[k].get("title"), "error": "score came back without a basis"})
+                fb["basis"] = "not given"
+            out_all[i + k] = (score, fb)
+    return out_all
+
+
+def fit_backlog(sb, llm, agents, settings, run, exclude_keys=()):
+    """Leads saved earlier but left unscored (fit was off, not due, or the AI limit hit) get scored now."""
+    streams, docs, _, _, _, noise = load_context(sb)
+    rubrics = load_rubrics(sb, streams)
+    cfg = agents.get("fit")
+    limit = 2 * max(1, int((cfg or {}).get("max_items") or 8))
+    backlog = [l for l in sb.select("leads", {"owner_id": "eq." + OWNER_ID, "status": "eq.new", "created_at": "gte." + iso(now_utc() - timedelta(days=7)),
+                                              "select": "id,title,company,location,raw_snippet,jd_text,job_stream_id,dedup_key", "order": "created_at.desc", "limit": str(limit)})
+               if l.get("dedup_key") not in exclude_keys and l.get("id")]
+    n = 0
+    for s in streams:
+        items = [l for l in backlog if l.get("job_stream_id") == s["id"]]
+        resume = resume_for(s, docs)
+        if not items or not resume or llm.gave_up_429:
+            continue
+        thr = stream_threshold(rubrics, settings, s["id"])
+        res = score_items(llm, agents, s, resume, items, rubrics.get(s["id"]), run, "fit_backlog")
+        for k, (fs, fb) in res.items():
+            patch = {"fit_score": fs, "fit_breakdown": fb, "status": "fit_checked"}
+            if fs is not None and fs < thr:
+                patch.update(status="parked", noise_reason_id=noise.get("Fit below threshold"), matched_criterion="Fit below threshold")
+                run.parked += 1
+            sb.update("leads", {"id": items[k]["id"]}, patch)
+            n += 1
+    if n:
+        run.notes.append(f"backlog: scored {n} earlier leads")
+    return n
+
+
+def run_evals(sb, base_llm, agents, settings, max_runs=1):
+    """Process queued eval runs for the Fit agent (queued from the app). Never writes to leads."""
+    fit = agents.get("fit")
+    if not fit:
+        return 0
+    try:
+        queued = sb.select("agent_eval_runs", {"owner_id": "eq." + OWNER_ID, "agent_id": "eq." + fit["id"], "status": "eq.queued",
+                                               "select": "*", "order": "requested_at.asc", "limit": str(max_runs)})
+    except Exception as e:
+        log(f"eval runs not readable: {str(e)[:120]}")
+        return 0
+    done = 0
+    for er in queued:
+        run = Run(sb, "evals", "-")
+        sb.update("agent_eval_runs", {"id": er["id"]}, {"status": "running", "started_at": iso(now_utc())})
+        try:
+            pv = None
+            if er.get("prompt_version_id"):
+                rows = sb.select("agent_prompt_versions", {"id": "eq." + er["prompt_version_id"], "select": "id,version,system_template"})
+                pv = rows[0] if rows else None
+            ev_agents = dict(agents)
+            ev_agents["fit"] = dict(fit, prompt=pv or fit.get("prompt"))
+            streams, docs, _, _, _, _ = load_context(sb)
+            rubrics = load_rubrics(sb, streams, ids=list((er.get("rubric_version_ids") or {}).values()) or None)
+            for s in streams:  # a stream not in the request uses its active rubric
+                if s["id"] not in rubrics:
+                    rubrics.update(load_rubrics(sb, [s]))
+            cases = sb.select("agent_evals", {"owner_id": "eq." + OWNER_ID, "agent_id": "eq." + fit["id"], "is_active": "eq.true", "expected_band": "not.is.null", "select": "*"})
+            n_calls = sum(-(-len([c for c in cases if c.get("job_stream_id") == s["id"]]) // max(1, int(fit.get("max_items") or 8))) for s in streams)
+            llm = AgentLLM(base_llm, ev_agents["fit"], max_calls_default=None)
+            llm.max_calls = n_calls * 2 + 2   # the request is explicit; allow one retry per batch, not the live per-run cap
+            results, err_n = [], 0
+            for s in streams:
+                cs = [c for c in cases if c.get("job_stream_id") == s["id"]]
+                if not cs:
+                    continue
+                rv = rubrics.get(s["id"])
+                thr = float(((rv or {}).get("rubric") or {}).get("threshold", settings.get("fit_threshold", 60)))
+                res = score_items(llm, ev_agents, s, resume_for(s, docs), [dict(c.get("input") or {}) for c in cs], rv, run, "evals")
+                for k, c in enumerate(cs):
+                    i = c.get("input") or {}
+                    band = c.get("expected_band")
+                    lo, hi, push = BANDS.get(band, (c.get("expected_min") or 0, c.get("expected_max") or 100, False))
+                    lo = c.get("expected_min") if c.get("expected_min") is not None else lo
+                    hi = c.get("expected_max") if c.get("expected_max") is not None else hi
+                    row = {"case_id": c["id"], "title": i.get("title"), "company": i.get("company"), "stream_id": s["id"], "expected_band": band, "expected_min": lo, "expected_max": hi, "threshold": thr}
+                    if k in res and res[k][0] is not None:
+                        got, fb = res[k]
+                        row.update(got=got, decision_pass=(got >= thr) == push, band_pass=lo <= got <= hi,
+                                   params=(fb or {}).get("params"), basis=(fb or {}).get("basis"), note=(fb or {}).get("note"), caps_applied=(fb or {}).get("caps_applied") or [])
+                    else:
+                        err_n += 1
+                        row.update(got=None, decision_pass=False, band_pass=False, error="not scored (AI error or limit)")
+                    results.append(row)
+            scored = [r for r in results if r.get("got") is not None]
+            limit_hit = llm.gave_up_429 and not llm.capped
+            if not scored and results and limit_hit:
+                sb.update("agent_eval_runs", {"id": er["id"]}, {"status": "queued", "started_at": None,
+                                                                 "error": f"waiting: AI limit hit at {datetime.now(IST).strftime('%H:%M')} IST, retries next pass"})
+                run.notes.append("eval run put back in the queue: AI limit")
+            else:
+                dp = sum(1 for r in scored if r["decision_pass"])
+                bp = sum(1 for r in scored if r["band_pass"])
+                t = len(scored)
+                sb.update("agent_eval_runs", {"id": er["id"]}, {
+                    "status": "done", "finished_at": iso(now_utc()), "model": llm.label, "total": t, "decision_pass": dp, "band_pass": bp,
+                    "decision_agreement": round(100.0 * dp / t, 1) if t else None, "band_agreement": round(100.0 * bp / t, 1) if t else None,
+                    "results": results, "error": (f"{err_n} cases not scored" if err_n else None)})
+                run.read, run.created = len(results), t
+                run.notes.append(f"eval run: {t} cases scored, decision {dp}/{t}, band {bp}/{t}" + (f", {err_n} not scored" if err_n else ""))
+                done += 1
+            run.model = llm.label
+            run.finish(llm)
+        except Exception as e:
+            sb.update("agent_eval_runs", {"id": er["id"]}, {"status": "failed", "finished_at": iso(now_utc()), "error": str(e)[:500]})
+            run.errors.append({"stage": "evals", "error": str(e)[:300], "trace": traceback.format_exc()[-800:]})
+            run.finish()
+    return done
 
 
 # ---------------------------------------------------------------- Sourcer + Fit
@@ -672,7 +1008,7 @@ def sender_domains(sb):
 
 
 def load_context(sb):
-    streams = sb.select("job_streams", {"owner_id": "eq." + OWNER_ID, "is_active": "eq.true", "select": "id,name,goal,target_titles,locations,generic_document_id"})
+    streams = sb.select("job_streams", {"owner_id": "eq." + OWNER_ID, "is_active": "eq.true", "select": "id,name,goal,target_titles,locations,generic_document_id,fit_rubric_version_id"})
     docs = {d["id"]: d for d in sb.select("documents", {"owner_id": "eq." + OWNER_ID, "type": "eq.resume", "tag": "eq.generic", "select": "id,text,job_stream_id"})}
     boards = {b["name"].lower(): b["id"] for b in sb.select("job_boards", {"owner_id": "eq." + OWNER_ID, "kind": "eq.portal", "select": "id,name,kind"})}
     alerts = sb.select("alert_definitions", {"owner_id": "eq." + OWNER_ID, "select": "id,job_stream_id,sender_pattern,query_text"})
@@ -765,8 +1101,15 @@ def stream_by_title(title, streams):
     return best
 
 
-def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None):
+def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None, agents=None, llm_fit=None, do_fit=True):
     streams, docs, boards, alerts, criteria, noise = load_context(sb)
+    agents = agents or {}
+    scfg = agents.get("sourcer")
+    llm_fit = llm_fit or llm
+    rubrics = load_rubrics(sb, streams)
+    max_mails = int((scfg or {}).get("max_items") or MAX_MAILS_PER_RUN)
+    rules_first = guard_on(scfg, "rules_first", True)
+    extract_sys = render_system("sourcer", template_for(agents, "sourcer"), streams=streams)
     stream_by_name = {s["name"].lower(): s for s in streams}
     stream_desc = "\n".join(f'- "{s["name"]}": goal={s.get("goal") or ""}; target titles={", ".join(s.get("target_titles") or [])}' for s in streams)
     existing = {l["dedup_key"] for l in sb.select("leads", {"owner_id": "eq." + OWNER_ID, "select": "dedup_key", "created_at": "gte." + iso(now_utc() - timedelta(days=45))})}
@@ -790,9 +1133,9 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None):
         uids = sorted(uids)
         retry = {int(r["uid"]): int(r.get("tries", 0)) for r in (settings.get("mail_retry") or []) if r.get("uid")}
         retry_uids = sorted(u for u in retry if u not in uids)
-        if len(uids) > MAX_MAILS_PER_RUN:
-            run.notes.append(f"{len(uids)} new mails, taking {MAX_MAILS_PER_RUN} this run")
-            uids = uids[:MAX_MAILS_PER_RUN]
+        if len(uids) > max_mails:
+            run.notes.append(f"{len(uids)} new mails, taking {max_mails} this run")
+            uids = uids[:max_mails]
         max_uid = int(last_uid or 0)
         for u in retry_uids + uids:
             if u not in retry:
@@ -831,7 +1174,7 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None):
             retry_next += [{"uid": x["uid"], "tries": x.get("tries", 0), "msg_id": x["msg_id"]} for x in rest if x["uid"]]
             break
         out = None
-        if "linkedin.com" in m["from"]:
+        if rules_first and "linkedin.com" in m["from"]:
             jobs = parse_linkedin_alert(m["text"])
             if jobs:
                 out = {"is_job_alert": True, "jobs": jobs}
@@ -842,7 +1185,8 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None):
                 retry_next.append({"uid": m["uid"], "tries": m.get("tries", 0), "msg_id": m["msg_id"]})
                 continue
             try:
-                out = llm.json(EXTRACT_SYS + "\n\nStreams:\n" + stream_desc, f"From: {m['from']}\nSubject: {m['subject']}\nDate: {m['date']}\n\n{m['text']}")
+                out = llm_json_checked(llm, extract_sys, f"From: {m['from']}\nSubject: {m['subject']}\nDate: {m['date']}\n\n{m['text']}",
+                                       lambda o: isinstance(o, dict) and isinstance(o.get("jobs", []), list))
             except Exception as e:
                 tries = m.get("tries", 0) + 1
                 if m["uid"] and tries < MAX_MAIL_TRIES:
@@ -893,175 +1237,34 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None):
     elif retry_next:
         run.notes.append(f"dry run: {len(retry_next)} mails would go to the retry list")
 
-    # 2b) JD Fetcher: full job description for every live lead before Fit (v1.0.8)
-    jdb = JDBudget(dry=sb.dry)
-    run.jd_budget = jdb
-    for l in new_leads:
-        if l["status"] != "new" or not l.get("url") or not jdb.left():
-            continue
-        r = jdb.fetch(l["url"], l["title"])
-        l["jd_fetch_attempts"] = 1
-        if r.get("error"):
-            l["jd_last_error"] = r["error"][:300]
-        else:
-            l.update(jd_text=r["text"], jd_source_url=r["source_url"], jd_confidence=r["confidence"], jd_fetched_at=iso(now_utc()))
-    if jdb.n:
-        run.notes.append(f"JD: {jdb.ok} fetched, {jdb.failed} failed for new leads")
-
-    # 3) fit scoring for live leads, per stream, batches of FIT_BATCH
+    # 3) fit scoring for live leads, per stream (rubric from the Agents screen; batch size = Fit "max items")
     live = [l for l in new_leads if l["status"] == "new"]
-    for s in streams:
+    if live and not do_fit:
+        run.notes.append(f"fit is off or not due: {len(live)} leads saved unscored")
+    for s in (streams if do_fit else []):
         batch_all = [l for l in live if l["job_stream_id"] == s["id"]]
-        resume = (docs.get(s.get("generic_document_id")) or {}).get("text") or next((d["text"] for d in docs.values() if d["job_stream_id"] == s["id"]), "")
+        if not batch_all:
+            continue
+        resume = resume_for(s, docs)
         if not resume:
             run.notes.append(f"stream {s['name']}: no generic resume, leads left unscored")
             continue
-        for i in range(0, len(batch_all), FIT_BATCH):
-            batch = batch_all[i:i + FIT_BATCH]
-            if llm.gave_up_429:
-                run.notes.append(f"stream {s['name']}: Gemini limit hit, {len(batch)} leads left unscored for later")
-                break
-            payload = {"stream_goal": s.get("goal"), "stream_locations": s.get("locations"), "resume": resume[:9000],
-                       "jobs": [dict(jd_payload(l), index=k) for k, l in enumerate(batch)]}
-            try:
-                out = llm.json(FIT_SYS, json.dumps(payload))
-                for sc in out.get("scores") or []:
-                    l = batch[int(sc["index"])]
-                    l["fit_score"], l["fit_breakdown"], l["status"] = sc.get("fit_score"), sc.get("fit_breakdown"), "fit_checked"
-            except Exception as e:
-                run.errors.append({"stage": "fit", "stream": s["name"], "error": str(e)[:300]})
+        res = score_items(llm_fit, agents, s, resume, batch_all, rubrics.get(s["id"]), run, "fit")
+        for k, (fs, fb) in res.items():
+            batch_all[k]["fit_score"], batch_all[k]["fit_breakdown"], batch_all[k]["status"] = fs, fb, "fit_checked"
 
     # 4) write
     if new_leads:
         for l in new_leads:
-            if l["status"] == "fit_checked" and (l.get("fit_score") or 0) < int(settings.get("fit_threshold", 60)) and l.get("fit_score") is not None:
+            if l["status"] == "fit_checked" and l.get("fit_score") is not None and l["fit_score"] < stream_threshold(rubrics, settings, l["job_stream_id"]):
                 l["status"], l["noise_reason_id"], l["matched_criterion"] = "parked", noise.get("Fit below threshold"), "Fit below threshold"
                 run.parked += 1
-        keys = set().union(*(l.keys() for l in new_leads))
-        for l in new_leads:
-            for k in keys:
-                l.setdefault(k, 0 if k == "jd_fetch_attempts" else None)
         rows = sb.insert("leads", new_leads)
         run.created = len(rows)
         for aid in {l["alert_definition_id"] for l in new_leads if l.get("alert_definition_id")}:
             sb.update("alert_definitions", {"id": aid}, {"last_lead_at": iso(now_utc())})
 
-    # 5) backlog: leads saved earlier but left unscored (limit hit, error) get scored now, max 16 per run
-    if not llm.gave_up_429:
-        just = {l.get("dedup_key") for l in new_leads}
-        backlog = [l for l in sb.select("leads", {"owner_id": "eq." + OWNER_ID, "status": "eq.new", "created_at": "gte." + iso(now_utc() - timedelta(days=7)),
-                                                   "select": "id,title,company,location,raw_snippet,job_stream_id,dedup_key,jd_text", "order": "created_at.desc", "limit": "16"})
-                   if l.get("dedup_key") not in just and l.get("id")]
-        thr = int(settings.get("fit_threshold", 60))
-        for s in streams:
-            batch = [l for l in backlog if l.get("job_stream_id") == s["id"]][:FIT_BATCH]
-            resume = (docs.get(s.get("generic_document_id")) or {}).get("text") or next((d["text"] for d in docs.values() if d["job_stream_id"] == s["id"]), "")
-            if not batch or not resume or llm.gave_up_429:
-                continue
-            payload = {"stream_goal": s.get("goal"), "stream_locations": s.get("locations"), "resume": resume[:9000],
-                       "jobs": [dict(jd_payload(l), index=k) for k, l in enumerate(batch)]}
-            try:
-                out = llm.json(FIT_SYS, json.dumps(payload))
-                n = 0
-                for sc in out.get("scores") or []:
-                    l = batch[int(sc["index"])]
-                    fs = sc.get("fit_score")
-                    patch = {"fit_score": fs, "fit_breakdown": sc.get("fit_breakdown"), "status": "fit_checked"}
-                    if fs is not None and fs < thr:
-                        patch.update(status="parked", noise_reason_id=noise.get("Fit below threshold"), matched_criterion="Fit below threshold")
-                    sb.update("leads", {"id": l["id"]}, patch)
-                    n += 1
-                run.notes.append(f"backlog: scored {n} earlier leads ({s['name']})")
-            except Exception as e:
-                run.errors.append({"stage": "fit_backlog", "stream": s["name"], "error": str(e)[:300]})
-
-    # 6) JD backlog (v1.0.8): earlier leads and open applications that still have no JD
-    try:
-        jd_backlog(sb, llm, settings, run, streams, docs, getattr(run, "jd_budget", None) or JDBudget(dry=sb.dry),
-                   skip={l.get("dedup_key") for l in new_leads})
-    except Exception as e:
-        run.errors.append({"stage": "jd_backlog", "error": str(e)[:300]})
     return new_leads
-
-
-def jd_backlog(sb, llm, settings, run, streams, docs, jdb, skip=()):
-    since = iso(now_utc() - timedelta(days=14))
-    leads = sb.select("leads", {"owner_id": "eq." + OWNER_ID, "status": "in.(new,fit_checked,promoted)", "jd_text": "is.null",
-                                "jd_fetch_attempts": "lt." + str(JD_MAX_TRIES), "url": "not.is.null", "created_at": "gte." + since,
-                                "select": "id,title,company,location,raw_snippet,url,status,job_stream_id,jd_fetch_attempts,fit_score,dedup_key",
-                                "order": "created_at.desc", "limit": "30"})
-    rescore, n_ok, n_fail = [], 0, 0
-    for l in leads:
-        if not jdb.left():
-            break
-        if not l.get("id") or not l.get("url") or l.get("dedup_key") in skip:
-            continue
-        r = jdb.fetch(l["url"], l.get("title", ""))
-        tries = int(l.get("jd_fetch_attempts") or 0) + 1
-        if r.get("error"):
-            n_fail += 1
-            patch = {"jd_fetch_attempts": tries, "jd_last_error": r["error"][:300]}
-            if tries >= JD_MAX_TRIES:
-                patch["jd_confidence"] = "fetch_failed"
-            sb.update("leads", {"id": l["id"]}, patch)
-            continue
-        n_ok += 1
-        sb.update("leads", {"id": l["id"]}, {"jd_text": r["text"], "jd_source_url": r["source_url"], "jd_confidence": r["confidence"],
-                                             "jd_fetched_at": iso(now_utc()), "jd_fetch_attempts": tries, "jd_last_error": None})
-        if l.get("status") == "fit_checked":
-            l["jd_text"] = r["text"]
-            rescore.append(l)
-    if leads:
-        run.notes.append(f"JD backlog: {n_ok} lead JDs filled, {n_fail} failed")
-
-    # open applications (no lead, or a lead without JD): fill straight from the application's own link
-    tries_map = settings.get("jd_app_attempts") or {}
-    apps = sb.select("applications", {"owner_id": "eq." + OWNER_ID, "status": "in.(" + ",".join(OPEN_STATUSES) + ")", "jd_text": "is.null",
-                                      "url": "not.is.null", "select": "id,title,company,url,status", "order": "updated_at.desc", "limit": "30"})
-    a_ok = a_fail = 0
-    for a in apps:
-        if not jdb.left():
-            break
-        if not a.get("id") or not a.get("url") or int(tries_map.get(a["id"], 0)) >= JD_MAX_TRIES:
-            continue
-        r = jdb.fetch(a["url"], a.get("title", ""))
-        tries_map[a["id"]] = int(tries_map.get(a["id"], 0)) + 1
-        if r.get("error"):
-            a_fail += 1
-            if tries_map[a["id"]] >= JD_MAX_TRIES:
-                sb.update("applications", {"id": a["id"]}, {"jd_confidence": "fetch_failed"})
-            continue
-        a_ok += 1
-        sb.update("applications", {"id": a["id"]}, {"jd_text": r["text"], "jd_source_url": r["source_url"], "jd_confidence": r["confidence"],
-                                                    "jd_fetched_at": iso(now_utc())})
-    if apps:
-        run.notes.append(f"JD backlog: {a_ok} application JDs filled, {a_fail} failed")
-        if not sb.dry:
-            settings.set(jd_app_attempts=tries_map)
-
-    # re-score leads that were scored on the title alone; status is left as it is (they may already be on his phone)
-    if rescore and not llm.gave_up_429:
-        for s in streams:
-            resume = (docs.get(s.get("generic_document_id")) or {}).get("text") or next((d["text"] for d in docs.values() if d["job_stream_id"] == s["id"]), "")
-            todo = [l for l in rescore if l.get("job_stream_id") == s["id"]]
-            for i in range(0, len(todo), FIT_BATCH):
-                batch = todo[i:i + FIT_BATCH]
-                if not resume or llm.gave_up_429:
-                    break
-                payload = {"stream_goal": s.get("goal"), "stream_locations": s.get("locations"), "resume": resume[:9000],
-                           "jobs": [dict(jd_payload(l), index=k) for k, l in enumerate(batch)]}
-                try:
-                    out = llm.json(FIT_SYS, json.dumps(payload))
-                    for sc in out.get("scores") or []:
-                        l = batch[int(sc["index"])]
-                        fb = sc.get("fit_breakdown") or {}
-                        if isinstance(fb, dict):
-                            fb["rescored_with_jd"] = True
-                            fb["previous_score"] = l.get("fit_score")
-                        sb.update("leads", {"id": l["id"]}, {"fit_score": sc.get("fit_score"), "fit_breakdown": fb})
-                    run.notes.append(f"re-scored {len(batch)} leads with full JD ({s['name']})")
-                except Exception as e:
-                    run.errors.append({"stage": "fit_rescore", "stream": s["name"], "error": str(e)[:300]})
 
 
 # ---------------------------------------------------------------- Notifier
@@ -1098,9 +1301,12 @@ def notifier(sb, tg, settings, run):
         run.notes.append(f"daily cap {cap} reached")
         return 0
     notified = {n["lead_id"] for n in sb.select("notifications", {"owner_id": "eq." + OWNER_ID, "kind": "eq.new_lead", "select": "lead_id", "lead_id": "not.is.null"})}
-    leads = sb.select("leads", {"owner_id": "eq." + OWNER_ID, "status": "eq.fit_checked", "fit_score": "gte." + str(settings.get("fit_threshold", 60)),
-                                "select": "id,title,company,location,url,fit_score,fit_breakdown,age_days,easy_apply,created_at", "order": "fit_score.desc,created_at.desc", "limit": "50"})
-    leads = [l for l in leads if l["id"] not in notified][:budget]
+    streams = sb.select("job_streams", {"owner_id": "eq." + OWNER_ID, "select": "id,fit_rubric_version_id"})
+    rubrics = load_rubrics(sb, streams)
+    thrs = [stream_threshold(rubrics, settings, s["id"]) for s in streams] or [float(settings.get("fit_threshold", 60))]
+    leads = sb.select("leads", {"owner_id": "eq." + OWNER_ID, "status": "eq.fit_checked", "fit_score": "gte." + fmt_num(min(thrs)),
+                                "select": "id,title,company,location,url,fit_score,fit_breakdown,age_days,easy_apply,created_at,job_stream_id", "order": "fit_score.desc,created_at.desc", "limit": "50"})
+    leads = [l for l in leads if l["id"] not in notified and float(l.get("fit_score") or 0) >= stream_threshold(rubrics, settings, l.get("job_stream_id"))][:budget]
     n = 0
     for l in leads:
         text = "🆕 New lead\n" + fmt_lead(l) + "\n\nHow do you want to proceed?"
@@ -1241,7 +1447,13 @@ def status_line(sb):
 
 
 # ---------------------------------------------------------------- Nightly: status sync + sweeps + digest
-def status_sync(sb, gmail, llm, settings, run):
+def status_sync(sb, gmail, llm, settings, run, agents=None):
+    agents = agents or {}
+    cfg = agents.get("status_sync")
+    status_sys = render_system("status_sync", template_for(agents, "status_sync"))
+    min_conf = float(guard_value(cfg, "min_confidence", 0.7) or 0)
+    max_items = int((cfg or {}).get("max_items") or 0) or None
+    classified = 0
     apps = sb.select("applications", {"owner_id": "eq." + OWNER_ID, "final_status": "eq.open", "select": "id,company,title,status,rejection_email_id"})
     run.read = len(apps)
     seen_ids = {a.get("rejection_email_id") for a in apps}
@@ -1267,13 +1479,21 @@ def status_sync(sb, gmail, llm, settings, run):
             text = mail_text(msg)[:8000]
             if comp.lower() not in (text + (msg.get("Subject") or "")).lower():
                 continue
+            if max_items and classified >= max_items:
+                run.notes.append(f"max {max_items} mails classified; the rest wait for tomorrow")
+                return
+            if llm.gave_up_429:
+                run.notes.append("AI limit or max AI calls reached; the rest wait for tomorrow")
+                return
             try:
-                out = llm.json(STATUS_SYS, f"Application: {a['title']} at {comp}\nFrom: {frm}\nSubject: {msg.get('Subject')}\n\n{text}")
+                classified += 1
+                out = llm_json_checked(llm, status_sys, f"Application: {a['title']} at {comp}\nFrom: {frm}\nSubject: {msg.get('Subject')}\n\n{text}",
+                                       lambda o: isinstance(o, dict) and "outcome" in o)
             except Exception as e:
                 run.errors.append({"stage": "status_classify", "company": comp, "error": str(e)[:200]})
                 continue
             oc, conf = out.get("outcome"), float(out.get("confidence") or 0)
-            if conf < 0.7 or oc in ("other", "acknowledgement"):
+            if conf < min_conf or oc in ("other", "acknowledgement"):
                 continue
             nowi = iso(now_utc())
             if oc == "rejected" and a["status"] != "rejected":
@@ -1370,7 +1590,7 @@ def verify(env):
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["run", "nightly", "verify"])
+    ap.add_argument("mode", choices=["run", "nightly", "verify", "evals"])
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     env = {k: os.environ.get(k, "") for k in ["GMAIL_USER", "GMAIL_APP_PASSWORD", "GEMINI_API_KEY", "TELEGRAM_BOT_TOKEN", "SUPABASE_URL", "SUPABASE_SERVICE_KEY", "GEMINI_MODEL"]}
@@ -1416,34 +1636,24 @@ def main():
         fixtures = None
 
     failures = 0
+    agents = load_agents(sb)
     try:
-        if args.mode == "run":
-            r = Run(sb, "sourcer+fit", model)
+        if args.mode == "evals":
+            run_evals(sb, llm, agents, settings, max_runs=3)
+        elif args.mode == "run":
+            failures += cycle(sb, gmail, llm, tg, settings, model, agents, fixtures)
             try:
-                sourcer(sb, gmail, llm, settings, r, dry_fixtures=fixtures)
+                run_evals(sb, llm, agents, settings)
             except Exception as e:
-                r.errors.append({"stage": "sourcer", "error": str(e)[:300], "trace": traceback.format_exc()[-800:]}); failures += 1
-            r.finish(llm)
-            r = Run(sb, "notifier", "-")
-            try:
-                notifier(sb, tg, settings, r)
-            except Exception as e:
-                r.errors.append({"stage": "notifier", "error": str(e)[:300]}); failures += 1
-            r.finish()
-            r = Run(sb, "replies", "-")
-            try:
-                replies(sb, tg, settings, r)
-            except Exception as e:
-                r.errors.append({"stage": "replies", "error": str(e)[:300]}); failures += 1
-            r.finish()
+                log(f"evals failed: {e}")
             if nightly_due(settings):
                 log("nightly due and not yet done today -> running it inside this run")
-                failures += nightly(sb, gmail, llm, tg, settings, model)
+                failures += nightly(sb, gmail, llm, tg, settings, model, agents, fixtures)
         else:
             if not dry and not nightly_due(settings) and os.environ.get("FORCE_NIGHTLY") != "1":
                 log("nightly already done today (a run after 21:36 IST did it); skipping. Set FORCE_NIGHTLY=1 to force.")
             else:
-                failures += nightly(sb, gmail, llm, tg, settings, model)
+                failures += nightly(sb, gmail, llm, tg, settings, model, agents, fixtures)
     finally:
         try:
             record_usage(settings, llm, tg, dry)
@@ -1520,36 +1730,112 @@ def usage_line(settings):
     return f"Gemini today: {u.get('calls', 0)} calls{pct}{lim}{gq}"
 
 
-def nightly(sb, gmail, llm, tg, settings, model):
+def source_and_fit(sb, gmail, llm, settings, model, agents, fixtures, phase):
+    """Sourcer and Fit for one phase. One agent_runs row ('sourcer+fit'), as before."""
     failures = 0
-    if True:
-        if True:
-            r = Run(sb, "status_sync", model)
-            try:
-                if gmail:
-                    status_sync(sb, gmail, llm, settings, r)
-                else:
-                    r.notes.append("dry run: status sync skipped (needs Gmail)")
-            except Exception as e:
-                r.errors.append({"stage": "status_sync", "error": str(e)[:300]}); failures += 1
-            r.finish(llm)
-            r = Run(sb, "sweeps", "-")
-            lines, waiting = [], 0
-            try:
-                lines, waiting = sweeps(sb, settings, r)
-            except Exception as e:
-                r.errors.append({"stage": "sweeps", "error": str(e)[:300]}); failures += 1
-            r.finish()
-            chat = settings.get("telegram_chat_id")
-            if chat:
-                retry_n = len(settings.get("mail_retry") or [])
-                digest = ("🌙 Nightly\n" + ("\n".join(lines) if lines else "Nothing overdue, nothing stale.") + f"\nLeads waiting in Inbox: {waiting}"
-                          + f"\n{usage_line(settings)}" + (f"\nMails waiting for retry: {retry_n}" if retry_n else "") + f"\n{APP_URL}")
-                tg.send(chat, digest)
-            if not sb.dry:
-                now = datetime.now(IST)
-                done_for = now.date() if now.strftime("%H:%M") >= NIGHTLY_AT else now.date() - timedelta(days=1)
-                settings.set(last_nightly_date=done_for.isoformat())
+    do_src, why_src = due(agents, "sourcer", phase)
+    do_fit, why_fit = due(agents, "fit", phase)
+    if not do_src and not do_fit:
+        if phase == "cycle":
+            log(f"sourcer: {why_src}; fit: {why_fit}")
+            mark(sb, agents, "sourcer", False, "skipped: " + why_src)
+            mark(sb, agents, "fit", False, "skipped: " + why_fit)
+        return 0
+    r = Run(sb, "sourcer+fit", model)
+    llm_x = AgentLLM(llm, agents.get("sourcer"))
+    llm_f = AgentLLM(llm, agents.get("fit"))
+    for k, x in (("sourcer", llm_x), ("fit", llm_f)):
+        if x.skipped:
+            r.notes.append(f"{k}: skipped model {', '.join(x.skipped)}")
+    new = []
+    if do_src:
+        try:
+            new = sourcer(sb, gmail, llm_x, settings, r, dry_fixtures=fixtures, agents=agents, llm_fit=llm_f, do_fit=do_fit) or []
+        except Exception as e:
+            r.errors.append({"stage": "sourcer", "error": str(e)[:300], "trace": traceback.format_exc()[-800:]}); failures += 1
+    else:
+        r.notes.append("sourcer: " + why_src)
+    if do_fit:
+        try:
+            fit_backlog(sb, llm_f, agents, settings, r, exclude_keys={l.get("dedup_key") for l in new})
+        except Exception as e:
+            r.errors.append({"stage": "fit_backlog", "error": str(e)[:300], "trace": traceback.format_exc()[-800:]}); failures += 1
+    else:
+        r.notes.append("fit: " + why_fit)
+    r.model = "/".join(x for x in (llm_x.label, llm_f.label) if x != "-") or "-"
+    r.finish(TokenSum(llm_x, llm_f))
+    st = "ran with errors" if r.errors else "ran"
+    mark(sb, agents, "sourcer", do_src, st if do_src else "skipped: " + why_src)
+    mark(sb, agents, "fit", do_fit, st if do_fit else "skipped: " + why_fit)
+    return failures
+
+
+def cycle(sb, gmail, llm, tg, settings, model, agents, fixtures):
+    failures = source_and_fit(sb, gmail, llm, settings, model, agents, fixtures, "cycle")
+    do_n, why_n = due(agents, "notifier", "cycle")
+    r = Run(sb, "notifier", "-")
+    if do_n:
+        try:
+            notifier(sb, tg, settings, r)
+        except Exception as e:
+            r.errors.append({"stage": "notifier", "error": str(e)[:300]}); failures += 1
+    else:
+        r.notes.append("notifier: " + why_n + " (no pushes)")
+    r.finish()
+    mark(sb, agents, "notifier", do_n, ("ran with errors" if r.errors else "ran") if do_n else "skipped: " + why_n)
+    r = Run(sb, "replies", "-")   # your button taps are always processed
+    try:
+        replies(sb, tg, settings, r)
+    except Exception as e:
+        r.errors.append({"stage": "replies", "error": str(e)[:300]}); failures += 1
+    r.finish()
+    return failures
+
+
+def nightly(sb, gmail, llm, tg, settings, model, agents=None, fixtures=None):
+    agents = agents or {}
+    failures = source_and_fit(sb, gmail, llm, settings, model, agents, fixtures, "nightly")  # only agents set to "nightly"
+    do_s, why_s = due(agents, "status_sync", "nightly")
+    r = Run(sb, "status_sync", model)
+    llm_s = AgentLLM(llm, agents.get("status_sync"))
+    if do_s:
+        try:
+            if gmail:
+                status_sync(sb, gmail, llm_s, settings, r, agents)
+            else:
+                r.notes.append("dry run: status sync skipped (needs Gmail)")
+        except Exception as e:
+            r.errors.append({"stage": "status_sync", "error": str(e)[:300]}); failures += 1
+    else:
+        r.notes.append("status sync: " + why_s)
+    r.model = llm_s.label
+    r.finish(llm_s)
+    mark(sb, agents, "status_sync", do_s, ("ran with errors" if r.errors else "ran") if do_s else "skipped: " + why_s)
+    do_w, why_w = due(agents, "sweeps", "nightly")
+    r = Run(sb, "sweeps", "-")
+    lines, waiting = [], 0
+    if do_w:
+        try:
+            lines, waiting = sweeps(sb, settings, r)
+        except Exception as e:
+            r.errors.append({"stage": "sweeps", "error": str(e)[:300]}); failures += 1
+    else:
+        r.notes.append("sweeps: " + why_w)
+        waiting = len(sb.select("leads", {"owner_id": "eq." + OWNER_ID, "status": "eq.fit_checked", "select": "id"}))
+    r.finish()
+    mark(sb, agents, "sweeps", do_w, ("ran with errors" if r.errors else "ran") if do_w else "skipped: " + why_w)
+    chat = settings.get("telegram_chat_id")
+    if chat:
+        retry_n = len(settings.get("mail_retry") or [])
+        off = [a["name"] for a in agents.values() if a.get("built_status") != "not_built" and not a.get("enabled")]
+        digest = ("🌙 Nightly\n" + ("\n".join(lines) if lines else ("Nothing overdue, nothing stale." if do_w else "Sweeps are off.")) + f"\nLeads waiting in Inbox: {waiting}"
+                  + f"\n{usage_line(settings)}" + (f"\nMails waiting for retry: {retry_n}" if retry_n else "")
+                  + (f"\nAgents off: {', '.join(off)}" if off else "") + f"\n{APP_URL}")
+        tg.send(chat, digest)
+    if not sb.dry:
+        now = datetime.now(IST)
+        done_for = now.date() if now.strftime("%H:%M") >= NIGHTLY_AT else now.date() - timedelta(days=1)
+        settings.set(last_nightly_date=done_for.isoformat())
     return failures
 
 
@@ -1567,8 +1853,28 @@ class DrySupabase(Supabase):
             "filter_criteria": [{"criterion_type": "title_exclude", "value": "Project Manager", "job_stream_id": None}, {"criterion_type": "location_allow", "value": "Chennai", "job_stream_id": None}, {"criterion_type": "location_allow", "value": "Remote", "job_stream_id": None}],
             "noise_reasons": [{"id": "n1", "reason": "Title excluded"}, {"id": "n2", "reason": "Location not allowed"}, {"id": "n3", "reason": "Fit below threshold"}, {"id": "n4", "reason": "Older than 14 days"}, {"id": "n5", "reason": "Parked by you"}],
             "leads": [{"dedup_key": "existing co|product manager|chennai", "email_message_id": "<old>", "status": "fit_checked", "job_stream_id": PM_STREAM, "job_board_id": "b-li", "source_platform": "linkedin", "fit_score": 70, "id": "lead-old", "title": "Product Manager", "company": "Existing Co", "location": "Chennai", "url": "https://x/1", "fit_breakdown": {"note": "old"}, "age_days": 3, "easy_apply": True, "created_at": iso(now_utc())}],
-            "notifications": [], "applications": [{"id": "app-dry", "title": "Senior PM", "company": "Dry Co", "status": "applied", "url": "https://boards.example/dry"}], "interviews": [],
+            "notifications": [], "applications": [], "interviews": [],
         }
+        if os.environ.get("DRY_NO_AGENTS") != "1":
+            rub = {"threshold": 60, "params": [
+                {"key": "role_level", "name": "Role level", "weight": 25, "enabled": True, "description": "seniority", "anchors": {"high": "Senior", "mid": "PM", "low": "Junior"}, "cap": {"below": 30, "max": 40}, "if_unknown": "neutral"},
+                {"key": "location", "name": "Location", "weight": 15, "enabled": True, "description": "city", "anchors": {"high": "Chennai", "mid": "Bengaluru", "low": "other"}, "cap": {"below": 30, "max": 50}, "if_unknown": "neutral"},
+                {"key": "must_haves", "name": "Must-haves", "weight": 15, "enabled": True, "description": "JD", "anchors": {"high": "all", "mid": "most", "low": "none"}, "cap": None, "if_unknown": "skip"}]}
+            self.tables["job_streams"][0]["fit_rubric_version_id"] = "rv1"
+            self.tables["fit_rubric_versions"] = [{"id": "rv1", "version": 1, "job_stream_id": PM_STREAM, "rubric": rub}]
+            self.tables["agent_prompt_versions"] = [
+                {"id": "pv-src", "version": 1, "system_template": DEFAULT_TEMPLATE["sourcer"]},
+                {"id": "pv-fit", "version": 1, "system_template": "You are a strict recruiter.\nParameters:\n{{rubric}}\nPark below {{threshold}}."},
+                {"id": "pv-st", "version": 1, "system_template": DEFAULT_TEMPLATE["status_sync"]}]
+            mk = lambda k, en=True, mode="every_run", pv=None, gr=None, mi=None: {"id": "ag-" + k, "key": k, "name": k, "enabled": en, "built_status": "live", "schedule": {"mode": mode},
+                                                                              "model": {"primary": "gemini", "fallback": "groq"}, "active_prompt_version_id": pv, "guardrails": gr or [], "max_items": mi, "last_run_at": None}
+            self.tables["agents"] = [mk("sourcer", pv="pv-src", mi=25), mk("fit", pv="pv-fit", mi=8, gr=[{"key": "max_calls", "on": True, "value": 6}, {"key": "require_basis", "on": True}]),
+                                     mk("notifier"), mk("status_sync", mode="nightly", pv="pv-st", gr=[{"key": "min_confidence", "on": True, "value": 0.7}]), mk("sweeps", mode="nightly")]
+            self.tables["agent_evals"] = [{"id": "ev1", "agent_id": "ag-fit", "job_stream_id": PM_STREAM, "is_active": True, "expected_band": "strong", "expected_min": 80, "expected_max": 100,
+                                           "input": {"title": "Senior Product Manager", "company": "Acme", "location": "Chennai"}},
+                                          {"id": "ev2", "agent_id": "ag-fit", "job_stream_id": PM_STREAM, "is_active": True, "expected_band": "no", "expected_min": 0, "expected_max": 39,
+                                           "input": {"title": "Project Manager", "company": "Infra Co", "location": "Pune"}}]
+            self.tables["agent_eval_runs"] = [{"id": "er1", "agent_id": "ag-fit", "status": "queued", "prompt_version_id": "pv-fit", "rubric_version_ids": {PM_STREAM: "rv1"}}]
 
     def select(self, table, params):
         rows = self.tables.get(table, [])
