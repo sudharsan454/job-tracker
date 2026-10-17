@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0.8 · 17 Oct 2026 · v1.0.8: reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. Falls back to the v1.0.7 behaviour if the agents table cannot be read. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
+# Job Application Driver · permanent runner · v1.0.9 · 17 Oct 2026 · v1.0.9: JD Fetcher (v1.0.8) merged with the agents config. Reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. The JD Fetcher has its own agent row (on/off, max pages per run); JD re-scoring uses the rubric; fit batch defaults to 4. Falls back to built-in behaviour if the agents table cannot be read. v1.0.8: JD Fetcher. Every live lead gets its full job description (LinkedIn public job page, no login; else the company's own apply/careers page via JSON-LD or page text) saved in leads.jd_text before Fit runs, and Fit now scores against the JD (batches of 4). Earlier leads and open applications without a JD are filled in later runs (max 3 tries each, then jd_confidence=fetch_failed). Leads already scored get re-scored once their JD lands. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone, date
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.8"
+VERSION = "1.0.9"
 IST = ZoneInfo("Asia/Kolkata")
 OWNER_ID = os.environ.get("OWNER_ID", "f0c721b5-e317-49c4-b02c-d7822411fa55")  # sudharsan454@gmail.com auth user
 PM_STREAM = "11111111-1111-4111-8111-000000000001"
@@ -28,6 +28,13 @@ OPEN_STATUSES = ["applied", "screening", "round_1", "round_2", "round_3", "offer
 MAX_MAILS_PER_RUN = 25       # Gemini free tier is rate-limited; the rest carry over to the next run
 EXTRACT_BUDGET_S = 300       # stop reading mails after 5 min so push + replies always run inside the job
 MAX_MAIL_TRIES = 3           # a mail that keeps failing is dropped after 3 runs (logged with its message id)
+JD_MAX_PER_RUN = 20          # job pages fetched per run (new leads + backlog)
+JD_BUDGET_S = 180            # time budget for JD fetching per run
+JD_PAUSE_S = 4               # pause between LinkedIn page fetches
+JD_MAX_TRIES = 3             # a JD that keeps failing is marked fetch_failed after 3 runs
+JD_STORE_MAX = 30000         # max chars stored per JD
+JD_FOR_FIT = 3500            # JD chars sent to the fit model per job
+FIT_BATCH = 4                # jobs per fit call (smaller now that full JDs go in)
 NIGHTLY_AT = "21:36"         # IST; nightly work runs in the first run at or after this time each day
 
 
@@ -410,6 +417,156 @@ def html_to_text(s):
     return t.strip()
 
 
+# ---------------------------------------------------------------- JD Fetcher (v1.0.8)
+BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+JD_WORDS = re.compile(r"responsib|requirement|qualification|experience|what you|about the role|you will|skills", re.I)
+
+
+def http_text(url, timeout=25):
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA, "Accept": "text/html,application/xhtml+xml",
+                                               "Accept-Language": "en-US,en;q=0.9"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read(3_000_000).decode(r.headers.get_content_charset() or "utf-8", errors="replace")
+            return r.status, body, r.geturl()
+    except urllib.error.HTTPError as e:
+        return e.code, "", url
+    except Exception as e:
+        return 0, str(e)[:200], url
+
+
+def jsonld_jobposting(body):
+    """Most ATS pages (Greenhouse, Lever, Workday, Ashby, SmartRecruiters) embed a schema.org JobPosting."""
+    for blob in re.findall(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', body, re.S | re.I):
+        try:
+            data = json.loads(blob.strip())
+        except Exception:
+            continue
+        stack = [data]
+        while stack:
+            d = stack.pop()
+            if isinstance(d, list):
+                stack.extend(d)
+            elif isinstance(d, dict):
+                t = d.get("@type")
+                if (t == "JobPosting" or (isinstance(t, list) and "JobPosting" in t)) and d.get("description"):
+                    return d
+                stack.extend(v for v in d.values() if isinstance(v, (list, dict)))
+    return None
+
+
+def generic_jd(url):
+    st, body, final = http_text(url)
+    if st != 200 or not body:
+        return {"error": f"page HTTP {st}"}
+    jp = jsonld_jobposting(body)
+    if jp:
+        txt = html_to_text(jp["description"]) if "<" in jp["description"] else html.unescape(jp["description"])
+        head = [f"Source: {final}"]
+        if jp.get("title"):
+            head.append(f"Title: {jp['title']}")
+        if jp.get("employmentType"):
+            head.append(f"Employment type: {jp['employmentType']}")
+        if len(txt) >= 300:
+            return {"text": "\n".join(head) + "\n\n" + txt, "source_url": final, "confidence": "full" if len(txt) >= 800 else "partial"}
+    body = re.sub(r"<(nav|header|footer|aside|form)\b.*?</\1>", " ", body, flags=re.S | re.I)
+    txt = html_to_text(body)
+    if len(txt) >= 800 and len(JD_WORDS.findall(txt)) >= 2:
+        return {"text": f"Source: {final}\n(page text, not a structured job description)\n\n" + txt[:15000], "source_url": final, "confidence": "partial"}
+    return {"error": "no job description found on page"}
+
+
+def li_job_id(url):
+    m = re.search(r"linkedin\.com/(?:comm/)?jobs/view/(?:[^/?#]*?-)?(\d{6,})", url or "") or re.search(r"currentJobId=(\d{6,})", url or "")
+    return m.group(1) if m else None
+
+
+def linkedin_jd(jid, state):
+    if state.get("li_blocked", 0) >= 2:
+        return {"error": "linkedin blocked this run"}
+    st, body, _ = http_text(f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{jid}")
+    time.sleep(JD_PAUSE_S)
+    if st in (429, 999, 403):
+        state["li_blocked"] = state.get("li_blocked", 0) + 1
+        return {"error": f"linkedin HTTP {st} (blocked/rate limited)"}
+    if st != 200 or not body:
+        return {"error": f"linkedin HTTP {st}"}
+    m = re.search(r'class="show-more-less-html__markup[^"]*"[^>]*>(.*?)</div>\s*(?:<button|</section>)', body, re.S) \
+        or re.search(r'class="description__text[^"]*"[^>]*>(.*?)</section>', body, re.S)
+    desc = html_to_text(m.group(1)) if m else ""
+    head = [f"Source: LinkedIn job {jid}"]
+    for k, v in re.findall(r'description__job-criteria-subheader[^>]*>\s*(.*?)\s*</h3>\s*<span[^>]*>\s*(.*?)\s*</span>', body, re.S):
+        head.append(f"{html.unescape(k).strip()}: {html.unescape(v).strip()}")
+    if re.search(r"No longer accepting applications", body, re.I):
+        head.append("Posting status: no longer accepting applications")
+    offsite = None
+    a = re.search(r'<code id="applyUrl"[^>]*><!--"(.*?)"--></code>', body, re.S)
+    if a:
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(html.unescape(a.group(1))).query)
+        offsite = (q.get("url") or [None])[0]
+    if offsite:
+        head.append(f"Company apply link: {offsite}")
+    return {"desc": desc, "head": head, "offsite": offsite}
+
+
+def fetch_jd(url, state):
+    """Returns {"text","source_url","confidence"} or {"error"}. LinkedIn public page first, then the company page."""
+    if not url:
+        return {"error": "no url"}
+    jid = li_job_id(url)
+    if not jid:
+        return generic_jd(url)
+    li = linkedin_jd(jid, state)
+    if li.get("error"):
+        return li
+    li_url = f"https://www.linkedin.com/jobs/view/{jid}/"
+    if len(li["desc"]) >= 600:
+        return {"text": "\n".join(li["head"]) + "\n\n" + li["desc"], "source_url": li_url, "confidence": "full"}
+    if li.get("offsite"):
+        g = generic_jd(li["offsite"])
+        if not g.get("error") and len(g["text"]) > len(li["desc"]):
+            g["text"] = "\n".join(li["head"]) + "\n\n" + g["text"]
+            return g
+    if li["desc"]:
+        return {"text": "\n".join(li["head"]) + "\n\n" + li["desc"], "source_url": li_url, "confidence": "partial"}
+    return {"error": "linkedin page had no description"}
+
+
+class JDBudget:
+    def __init__(self, dry=False, limit=JD_MAX_PER_RUN):
+        self.start, self.n, self.dry, self.state = time.time(), 0, dry, {}
+        self.limit = limit
+        self.ok = self.failed = 0
+
+    def left(self):
+        return self.n < self.limit and time.time() - self.start < JD_BUDGET_S
+
+    def fetch(self, url, title=""):
+        self.n += 1
+        if self.dry:
+            r = {"text": f"Source: dry run\n\nAbout the role: {title}. Responsibilities: own the roadmap. Requirements: 6+ years PM experience.",
+                 "source_url": url, "confidence": "full"}
+        else:
+            try:
+                r = fetch_jd(url, self.state)
+            except Exception as e:
+                r = {"error": f"fetch crashed: {str(e)[:150]}"}
+        if r.get("error"):
+            self.failed += 1
+        else:
+            self.ok += 1
+            r["text"] = r["text"][:JD_STORE_MAX]
+        return r
+
+
+def jd_payload(l):
+    jd = (l.get("jd_text") or "").strip()
+    job = {"title": l["title"], "company": l["company"], "location": l.get("location"), "snippet": l.get("raw_snippet")}
+    if jd:
+        job["jd"] = jd[:JD_FOR_FIT]
+    return job
+
+
 def mail_text(msg):
     body = msg.get_body(preferencelist=("plain", "html"))
     if body is None:
@@ -508,7 +665,7 @@ Rules: one entry per distinct job in the mail; use the job's own link (not unsub
 Assign "stream" by matching the job against each stream's target titles and goal; null if neither fits."""
 
 FIT_SYS = """SCORE_FIT. You are a strict recruiter screening jobs for one candidate. JSON only.
-Input: the candidate's resume, the job stream goal, and a list of jobs (index, title, company, location, snippet). Usually only title/company/location are known, so say so in "basis".
+Input: the candidate's resume, the job stream goal, and a list of jobs (index, title, company, location, snippet, and "jd" = the full job description when we have it). When "jd" is present, score against its real must-haves (years, domain, skills, level) and start "basis" with "full JD"; when it is missing, start "basis" with "title only".
 Return {"scores":[{"index":int,"fit_score":0-100,"fit_breakdown":{"basis":str,"role_level":str,"domain":str,"location":str,"must_haves":str,"note":str}}]}.
 Scoring: 80+ only when title, seniority and domain all match the stream; 60-79 plausible, worth a look; 40-59 stretch or domain shift; <40 wrong level, wrong function or clearly junior/senior-mismatch. Location outside the stream's cities and not remote: cap at 50. Keep every string under 120 chars."""
 
@@ -517,10 +674,10 @@ Return {"outcome": one of ["rejected","interview_invite","offer","assessment","a
 "rejected" only when the mail clearly says the candidate is not moving forward for this application."""
 
 
-# ---------------------------------------------------------------- Agents config (v1.0.8): read from public.agents on every pass
+# ---------------------------------------------------------------- Agents config (v1.0.9; merged with the JD Fetcher): read from public.agents on every pass
 # The web app's Agents screen writes these rows. render_rubric / render_system / compute_fit MUST stay identical
 # to agRubricText / agRenderSystem / agComputeFit in jobs/index.html (app v1.0.5+), so the preview there is what is sent here.
-DEFAULT_PHASE = {"sourcer": "cycle", "fit": "cycle", "notifier": "cycle", "status_sync": "nightly", "sweeps": "nightly"}
+DEFAULT_PHASE = {"sourcer": "cycle", "fit": "cycle", "jd_fetcher": "cycle", "notifier": "cycle", "status_sync": "nightly", "sweeps": "nightly"}
 MARK = {"fit": "SCORE_FIT.", "sourcer": "EXTRACT_JOBS.", "status_sync": "CLASSIFY_STATUS."}
 OUT_FORMAT = {
     "fit": 'Output format (fixed by the system): JSON only, no prose.\n{"scores":[{"index":<int>,"params":{"<parameter key>":{"score":<0-100 or null>,"why":"<under 120 chars>"}},"basis":"title_only | snippet | jd","note":"<under 120 chars>"}]}\nOne entry per job. Include every parameter key listed above.',
@@ -840,7 +997,7 @@ def fit_results(out, rubric, n, meta):
 def fit_payload(stream, resume, items):
     return {"stream_goal": stream.get("goal"), "stream_locations": stream.get("locations"), "resume": (resume or "")[:9000],
             "jobs": [{"index": k, "title": x.get("title"), "company": x.get("company"), "location": x.get("location"), "snippet": x.get("snippet") or x.get("raw_snippet"),
-                      "jd": ((x.get("jd_text") or "")[:3000] or None)} for k, x in enumerate(items)]}
+                      "jd": ((x.get("jd_text") or "")[:JD_FOR_FIT] or None)} for k, x in enumerate(items)]}
 
 
 def fit_system(agents, rubric):
@@ -864,7 +1021,7 @@ def resume_for(stream, docs):
 def score_items(llm, agents, stream, resume, items, rubric, run, stage):
     """Score a list of dicts (leads or eval inputs) for one stream in batches. Returns {position: (score, breakdown)}."""
     cfg = agents.get("fit")
-    batch_n = max(1, int((cfg or {}).get("max_items") or 8))
+    batch_n = max(1, int((cfg or {}).get("max_items") or FIT_BATCH))
     meta = {"prompt_version": ((cfg or {}).get("prompt") or {}).get("version"), "rubric_version": (rubric or {}).get("version")}
     rub = (rubric or {}).get("rubric")
     system = fit_system(agents, rub)
@@ -893,7 +1050,7 @@ def fit_backlog(sb, llm, agents, settings, run, exclude_keys=()):
     streams, docs, _, _, _, noise = load_context(sb)
     rubrics = load_rubrics(sb, streams)
     cfg = agents.get("fit")
-    limit = 2 * max(1, int((cfg or {}).get("max_items") or 8))
+    limit = 2 * max(1, int((cfg or {}).get("max_items") or FIT_BATCH))
     backlog = [l for l in sb.select("leads", {"owner_id": "eq." + OWNER_ID, "status": "eq.new", "created_at": "gte." + iso(now_utc() - timedelta(days=7)),
                                               "select": "id,title,company,location,raw_snippet,jd_text,job_stream_id,dedup_key", "order": "created_at.desc", "limit": str(limit)})
                if l.get("dedup_key") not in exclude_keys and l.get("id")]
@@ -945,7 +1102,7 @@ def run_evals(sb, base_llm, agents, settings, max_runs=1):
                 if s["id"] not in rubrics:
                     rubrics.update(load_rubrics(sb, [s]))
             cases = sb.select("agent_evals", {"owner_id": "eq." + OWNER_ID, "agent_id": "eq." + fit["id"], "is_active": "eq.true", "expected_band": "not.is.null", "select": "*"})
-            n_calls = sum(-(-len([c for c in cases if c.get("job_stream_id") == s["id"]]) // max(1, int(fit.get("max_items") or 8))) for s in streams)
+            n_calls = sum(-(-len([c for c in cases if c.get("job_stream_id") == s["id"]]) // max(1, int(fit.get("max_items") or FIT_BATCH))) for s in streams)
             llm = AgentLLM(base_llm, ev_agents["fit"], max_calls_default=None)
             llm.max_calls = n_calls * 2 + 2   # the request is explicit; allow one retry per batch, not the live per-run cap
             results, err_n = [], 0
@@ -1237,6 +1394,24 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None, agents=None, llm_f
     elif retry_next:
         run.notes.append(f"dry run: {len(retry_next)} mails would go to the retry list")
 
+    # 2b) JD Fetcher: full job description for every live lead before Fit (v1.0.8; on/off and max pages from the jd_fetcher agent row since v1.0.9)
+    do_jd, why_jd = due(agents, "jd_fetcher", "cycle")
+    jdb = JDBudget(dry=sb.dry, limit=(int((agents.get("jd_fetcher") or {}).get("max_items") or JD_MAX_PER_RUN) if do_jd else 0))
+    if not do_jd:
+        run.notes.append("JD fetcher: " + why_jd)
+    run.jd_budget = jdb
+    for l in new_leads:
+        if l["status"] != "new" or not l.get("url") or not jdb.left():
+            continue
+        r = jdb.fetch(l["url"], l["title"])
+        l["jd_fetch_attempts"] = 1
+        if r.get("error"):
+            l["jd_last_error"] = r["error"][:300]
+        else:
+            l.update(jd_text=r["text"], jd_source_url=r["source_url"], jd_confidence=r["confidence"], jd_fetched_at=iso(now_utc()))
+    if jdb.n:
+        run.notes.append(f"JD: {jdb.ok} fetched, {jdb.failed} failed for new leads")
+
     # 3) fit scoring for live leads, per stream (rubric from the Agents screen; batch size = Fit "max items")
     live = [l for l in new_leads if l["status"] == "new"]
     if live and not do_fit:
@@ -1259,12 +1434,95 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None, agents=None, llm_f
             if l["status"] == "fit_checked" and l.get("fit_score") is not None and l["fit_score"] < stream_threshold(rubrics, settings, l["job_stream_id"]):
                 l["status"], l["noise_reason_id"], l["matched_criterion"] = "parked", noise.get("Fit below threshold"), "Fit below threshold"
                 run.parked += 1
+        keys = set().union(*(l.keys() for l in new_leads))
+        for l in new_leads:
+            for k in keys:
+                l.setdefault(k, 0 if k == "jd_fetch_attempts" else None)
         rows = sb.insert("leads", new_leads)
         run.created = len(rows)
         for aid in {l["alert_definition_id"] for l in new_leads if l.get("alert_definition_id")}:
             sb.update("alert_definitions", {"id": aid}, {"last_lead_at": iso(now_utc())})
 
+    # 6) JD backlog (v1.0.8): earlier leads and open applications that still have no JD
+    try:
+        jd_backlog(sb, llm_fit, settings, run, streams, docs, getattr(run, "jd_budget", None) or JDBudget(dry=sb.dry, limit=0),
+                   skip={l.get("dedup_key") for l in new_leads}, agents=agents, rubrics=rubrics, do_fit=do_fit)
+    except Exception as e:
+        run.errors.append({"stage": "jd_backlog", "error": str(e)[:300]})
     return new_leads
+
+
+def jd_backlog(sb, llm, settings, run, streams, docs, jdb, skip=(), agents=None, rubrics=None, do_fit=True):
+    agents, rubrics = agents or {}, rubrics or {}
+    since = iso(now_utc() - timedelta(days=14))
+    leads = sb.select("leads", {"owner_id": "eq." + OWNER_ID, "status": "in.(new,fit_checked,promoted)", "jd_text": "is.null",
+                                "jd_fetch_attempts": "lt." + str(JD_MAX_TRIES), "url": "not.is.null", "created_at": "gte." + since,
+                                "select": "id,title,company,location,raw_snippet,url,status,job_stream_id,jd_fetch_attempts,fit_score,dedup_key",
+                                "order": "created_at.desc", "limit": "30"})
+    rescore, n_ok, n_fail = [], 0, 0
+    for l in leads:
+        if not jdb.left():
+            break
+        if not l.get("id") or not l.get("url") or l.get("dedup_key") in skip:
+            continue
+        r = jdb.fetch(l["url"], l.get("title", ""))
+        tries = int(l.get("jd_fetch_attempts") or 0) + 1
+        if r.get("error"):
+            n_fail += 1
+            patch = {"jd_fetch_attempts": tries, "jd_last_error": r["error"][:300]}
+            if tries >= JD_MAX_TRIES:
+                patch["jd_confidence"] = "fetch_failed"
+            sb.update("leads", {"id": l["id"]}, patch)
+            continue
+        n_ok += 1
+        sb.update("leads", {"id": l["id"]}, {"jd_text": r["text"], "jd_source_url": r["source_url"], "jd_confidence": r["confidence"],
+                                             "jd_fetched_at": iso(now_utc()), "jd_fetch_attempts": tries, "jd_last_error": None})
+        if l.get("status") == "fit_checked":
+            l["jd_text"] = r["text"]
+            rescore.append(l)
+    if leads:
+        run.notes.append(f"JD backlog: {n_ok} lead JDs filled, {n_fail} failed")
+
+    # open applications (no lead, or a lead without JD): fill straight from the application's own link
+    tries_map = settings.get("jd_app_attempts") or {}
+    apps = sb.select("applications", {"owner_id": "eq." + OWNER_ID, "status": "in.(" + ",".join(OPEN_STATUSES) + ")", "jd_text": "is.null",
+                                      "url": "not.is.null", "select": "id,title,company,url,status", "order": "updated_at.desc", "limit": "30"})
+    a_ok = a_fail = 0
+    for a in apps:
+        if not jdb.left():
+            break
+        if not a.get("id") or not a.get("url") or int(tries_map.get(a["id"], 0)) >= JD_MAX_TRIES:
+            continue
+        r = jdb.fetch(a["url"], a.get("title", ""))
+        tries_map[a["id"]] = int(tries_map.get(a["id"], 0)) + 1
+        if r.get("error"):
+            a_fail += 1
+            if tries_map[a["id"]] >= JD_MAX_TRIES:
+                sb.update("applications", {"id": a["id"]}, {"jd_confidence": "fetch_failed"})
+            continue
+        a_ok += 1
+        sb.update("applications", {"id": a["id"]}, {"jd_text": r["text"], "jd_source_url": r["source_url"], "jd_confidence": r["confidence"],
+                                                    "jd_fetched_at": iso(now_utc())})
+    if apps:
+        run.notes.append(f"JD backlog: {a_ok} application JDs filled, {a_fail} failed")
+        if not sb.dry:
+            settings.set(jd_app_attempts=tries_map)
+
+    # re-score leads that were scored on the title alone; status is left as it is (they may already be on his phone)
+    if rescore and do_fit and not llm.gave_up_429:
+        for s in streams:
+            resume = resume_for(s, docs)
+            todo = [l for l in rescore if l.get("job_stream_id") == s["id"]]
+            if not todo or not resume or llm.gave_up_429:
+                continue
+            res = score_items(llm, agents, s, resume, todo, rubrics.get(s["id"]), run, "fit_rescore")
+            for k, (fs, fb) in res.items():
+                if isinstance(fb, dict):
+                    fb["rescored_with_jd"] = True
+                    fb["previous_score"] = todo[k].get("fit_score")
+                sb.update("leads", {"id": todo[k]["id"]}, {"fit_score": fs, "fit_breakdown": fb})
+            if res:
+                run.notes.append(f"re-scored {len(res)} leads with full JD ({s['name']})")
 
 
 # ---------------------------------------------------------------- Notifier
@@ -1853,7 +2111,7 @@ class DrySupabase(Supabase):
             "filter_criteria": [{"criterion_type": "title_exclude", "value": "Project Manager", "job_stream_id": None}, {"criterion_type": "location_allow", "value": "Chennai", "job_stream_id": None}, {"criterion_type": "location_allow", "value": "Remote", "job_stream_id": None}],
             "noise_reasons": [{"id": "n1", "reason": "Title excluded"}, {"id": "n2", "reason": "Location not allowed"}, {"id": "n3", "reason": "Fit below threshold"}, {"id": "n4", "reason": "Older than 14 days"}, {"id": "n5", "reason": "Parked by you"}],
             "leads": [{"dedup_key": "existing co|product manager|chennai", "email_message_id": "<old>", "status": "fit_checked", "job_stream_id": PM_STREAM, "job_board_id": "b-li", "source_platform": "linkedin", "fit_score": 70, "id": "lead-old", "title": "Product Manager", "company": "Existing Co", "location": "Chennai", "url": "https://x/1", "fit_breakdown": {"note": "old"}, "age_days": 3, "easy_apply": True, "created_at": iso(now_utc())}],
-            "notifications": [], "applications": [], "interviews": [],
+            "notifications": [], "applications": [{"id": "app-dry", "title": "Senior PM", "company": "Dry Co", "status": "applied", "url": "https://boards.example/dry"}], "interviews": [],
         }
         if os.environ.get("DRY_NO_AGENTS") != "1":
             rub = {"threshold": 60, "params": [
@@ -1868,8 +2126,8 @@ class DrySupabase(Supabase):
                 {"id": "pv-st", "version": 1, "system_template": DEFAULT_TEMPLATE["status_sync"]}]
             mk = lambda k, en=True, mode="every_run", pv=None, gr=None, mi=None: {"id": "ag-" + k, "key": k, "name": k, "enabled": en, "built_status": "live", "schedule": {"mode": mode},
                                                                               "model": {"primary": "gemini", "fallback": "groq"}, "active_prompt_version_id": pv, "guardrails": gr or [], "max_items": mi, "last_run_at": None}
-            self.tables["agents"] = [mk("sourcer", pv="pv-src", mi=25), mk("fit", pv="pv-fit", mi=8, gr=[{"key": "max_calls", "on": True, "value": 6}, {"key": "require_basis", "on": True}]),
-                                     mk("notifier"), mk("status_sync", mode="nightly", pv="pv-st", gr=[{"key": "min_confidence", "on": True, "value": 0.7}]), mk("sweeps", mode="nightly")]
+            self.tables["agents"] = [mk("sourcer", pv="pv-src", mi=25), mk("fit", pv="pv-fit", mi=4, gr=[{"key": "max_calls", "on": True, "value": 6}, {"key": "require_basis", "on": True}]),
+                                     mk("notifier"), mk("jd_fetcher", mi=20), mk("status_sync", mode="nightly", pv="pv-st", gr=[{"key": "min_confidence", "on": True, "value": 0.7}]), mk("sweeps", mode="nightly")]
             self.tables["agent_evals"] = [{"id": "ev1", "agent_id": "ag-fit", "job_stream_id": PM_STREAM, "is_active": True, "expected_band": "strong", "expected_min": 80, "expected_max": 100,
                                            "input": {"title": "Senior Product Manager", "company": "Acme", "location": "Chennai"}},
                                           {"id": "ev2", "agent_id": "ag-fit", "job_stream_id": PM_STREAM, "is_active": True, "expected_band": "no", "expected_min": 0, "expected_max": 39,
