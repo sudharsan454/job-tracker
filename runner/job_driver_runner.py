@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0.12 · 17 Oct 2026 · v1.0.12: Resume Decider no longer spends a lead's 3 tries on outages (Jev 402/403 no credits, Gemini/Groq 429/503, no model left); it stops for the run, leaves the lead "not yet run" with the reason, and retries next pass. After the first Jev "no credits" reply, Jev is skipped for the rest of the run. v1.0.11: Jev (TypeSafe, via Vercel AI Gateway, secret AI_GATEWAY_API_KEY) as the judge for the new Resume Decider (picklist generic / tailored / not_run / failed on leads; per-stream criteria from the Agents screen; Jev scores each criterion, code applies weights and threshold; Gemini/Groq as backup; low-confidence flag; Failed after 3 tries) and as a shadow fit scorer (leads.fit_shadow, never used for decisions until it passes the eval gate). v1.0.10: fit replies are normalised before the format check (a bare list of scores, a single score object, or scores under "results"/"jobs" are accepted), and a reply that still fails is logged with its first 200 characters. v1.0.9: JD Fetcher (v1.0.8) merged with the agents config. Reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. The JD Fetcher has its own agent row (on/off, max pages per run); JD re-scoring uses the rubric; fit batch defaults to 4. Falls back to built-in behaviour if the agents table cannot be read. v1.0.8: JD Fetcher. Every live lead gets its full job description (LinkedIn public job page, no login; else the company's own apply/careers page via JSON-LD or page text) saved in leads.jd_text before Fit runs, and Fit now scores against the JD (batches of 4). Earlier leads and open applications without a JD are filled in later runs (max 3 tries each, then jd_confidence=fetch_failed). Leads already scored get re-scored once their JD lands. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
+# Job Application Driver · permanent runner · v1.0.14 · 20 Oct 2026 · v1.0.14: the JD backlog (filling job descriptions for earlier leads and open applications) is off by default; only new leads get a JD. Switch back on with user_settings.settings.jd_backlog = true. v1.0.13: agent run log. Every agent run writes its agent_runs row when it STARTS (status running) and fills it in at the end with status (success / partial / failed / skipped), error kinds (ai_busy, ai_limit, setup, format, network, gmail, jd_fetch, other), AI calls made, whether the Groq backup was used, and a link to the GitHub run. A row still 'running' after 40 minutes is marked crashed at the start of the next pass. Leads created by the sourcer carry agent_run_id. Telegram alert, at most once a day per agent and never in quiet hours, when an agent fails or crashes 3 runs in a row, hits a setup error twice in a row, or misses its slot (nightly agents after 30 h, every-N-hours agents after 1.5x N + 2 h). v1.0.12: Resume Decider no longer spends a lead's 3 tries on outages (Jev 402/403 no credits, Gemini/Groq 429/503, no model left); it stops for the run, leaves the lead "not yet run" with the reason, and retries next pass. After the first Jev "no credits" reply, Jev is skipped for the rest of the run. v1.0.11: Jev (TypeSafe, via Vercel AI Gateway, secret AI_GATEWAY_API_KEY) as the judge for the new Resume Decider (picklist generic / tailored / not_run / failed on leads; per-stream criteria from the Agents screen; Jev scores each criterion, code applies weights and threshold; Gemini/Groq as backup; low-confidence flag; Failed after 3 tries) and as a shadow fit scorer (leads.fit_shadow, never used for decisions until it passes the eval gate). v1.0.10: fit replies are normalised before the format check (a bare list of scores, a single score object, or scores under "results"/"jobs" are accepted), and a reply that still fails is logged with its first 200 characters. v1.0.9: JD Fetcher (v1.0.8) merged with the agents config. Reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. The JD Fetcher has its own agent row (on/off, max pages per run); JD re-scoring uses the rubric; fit batch defaults to 4. Falls back to built-in behaviour if the agents table cannot be read. v1.0.8: JD Fetcher. Every live lead gets its full job description (LinkedIn public job page, no login; else the company's own apply/careers page via JSON-LD or page text) saved in leads.jd_text before Fit runs, and Fit now scores against the JD (batches of 4). Earlier leads and open applications without a JD are filled in later runs (max 3 tries each, then jd_confidence=fetch_failed). Leads already scored get re-scored once their JD lands. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone, date
 from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.12"
+VERSION = "1.0.13"
 IST = ZoneInfo("Asia/Kolkata")
 OWNER_ID = os.environ.get("OWNER_ID", "f0c721b5-e317-49c4-b02c-d7822411fa55")  # sudharsan454@gmail.com auth user
 PM_STREAM = "11111111-1111-4111-8111-000000000001"
@@ -642,24 +642,174 @@ def in_quiet_hours(settings):
 
 
 # ---------------------------------------------------------------- Agent run bookkeeping
+PROVIDERS = {}   # set in main(): {"gemini": Gemini, "groq": Groq|None, "jev": Jev|None}; Run uses call-count deltas
+ERROR_KINDS = [  # same order and patterns as public.job_driver_error_kind() in Supabase and errKind() in the app
+    ("setup", r"\b40[123]\b|free tier users|insufficient|no AI_GATEWAY|missing secret|api key|unauthori|forbidden|credits"),
+    ("ai_limit", r"\b429\b|rate limit|quota|limit hit|max AI calls|no AI model available"),
+    ("ai_busy", r"\b503\b|high demand|overloaded|unavailable"),
+    ("format", r"format|json|parse|did not match"),
+    ("gmail", r"imap|\bUID\b|gmail|socket error: EOF"),
+    ("network", r"network|urlopen|timed? ?out|connection|socket|unreachable|reset by peer"),
+    ("jd_fetch", r"linkedin HTTP|page HTTP|job description"),
+]
+DID_WORK_RE = re.compile(r"(filled|scored|decided|fetched|created|sent|pushed|parked|moved|marked)\D{0,3}[1-9]|\b[1-9][0-9]* (lead|application|mail|job)", re.I)
+CRASH_AFTER_MIN = 40
+
+
+def error_kind(text):
+    for k, rx in ERROR_KINDS:
+        if re.search(rx, text or "", re.I):
+            return k
+    return "other"
+
+
+def error_kinds(errors):
+    return sorted({error_kind(str(e.get("error") if isinstance(e, dict) and e.get("error") else e)) for e in (errors or [])}) or None
+
+
+def provider_calls():
+    out = {}
+    for k, prov in PROVIDERS.items():
+        out[k] = int(getattr(prov, "calls", 0) or 0) if prov else 0
+    return out
+
+
+def github_run_url():
+    rid = os.environ.get("GITHUB_RUN_ID")
+    if not rid:
+        return None
+    return f'{os.environ.get("GITHUB_SERVER_URL", "https://github.com")}/{os.environ.get("GITHUB_REPOSITORY", "sudharsan454/job-tracker")}/actions/runs/{rid}'
+
+
 class Run:
+    """One agent_runs row. Written at the start (status running) so a crash leaves a trace; filled in by finish()."""
     def __init__(self, sb, agent, model):
         self.sb, self.agent, self.model = sb, agent, model
         self.started = now_utc()
         self.read = self.created = self.parked = 0
+        self.done = 0            # optional: units of real work done (lets a run with errors count as partial)
+        self.skipped = False     # set when the agent was deliberately not run (off / not due)
         self.errors, self.notes = [], []
         self.id = None
+        self._calls0 = provider_calls()
+        try:
+            r = sb.insert("agent_runs", {"agent": agent, "started_at": iso(self.started), "status": "running", "model": model,
+                                         "github_run_url": github_run_url()})
+            self.id = r[0]["id"] if r else None
+        except Exception as e:
+            log(f"[{agent}] start row not written ({str(e)[:120]}); it will be written at the end")
+
+    def status(self, summary):
+        if not self.errors:
+            return "skipped" if self.skipped and not (self.read or self.created or self.parked) else "success"
+        if self.done or self.created or self.parked or DID_WORK_RE.search(summary or ""):
+            return "partial"
+        return "failed"
 
     def finish(self, llm=None, summary=None):
+        summ = summary or "; ".join(self.notes)[:2000]
+        c1 = provider_calls()
+        delta = {k: c1.get(k, 0) - self._calls0.get(k, 0) for k in c1}
         row = {"agent": self.agent, "started_at": iso(self.started), "finished_at": iso(now_utc()), "items_read": self.read,
                "items_created": self.created, "items_parked": self.parked, "errors": self.errors or None,
-               "summary": summary or "; ".join(self.notes)[:2000], "model": self.model}
+               "summary": summ, "model": self.model, "status": self.status(summ), "error_kinds": error_kinds(self.errors),
+               "ai_calls": sum(delta.values()), "backup_used": delta.get("groq", 0) > 0, "github_run_url": github_run_url()}
         if llm:
             row["tokens_in"], row["tokens_out"] = llm.tokens_in, llm.tokens_out
-        r = self.sb.insert("agent_runs", row)
-        self.id = r[0]["id"] if r else None
-        log(f"[{self.agent}] read={self.read} created={self.created} parked={self.parked} errors={len(self.errors)} :: {row['summary'][:160]}")
+        r = None
+        if self.id and not str(self.id).startswith("dry-"):
+            try:
+                r = self.sb.update("agent_runs", {"id": self.id}, row)
+            except Exception as e:
+                log(f"[{self.agent}] could not finish row {self.id} ({str(e)[:120]}); inserting a new one")
+        elif self.id and self.sb.dry:
+            r = self.sb.update("agent_runs", {"id": self.id}, row) or [{"id": self.id}]
+        if not r:
+            r = self.sb.insert("agent_runs", row)
+            self.id = r[0]["id"] if r else self.id
+        log(f"[{self.agent}] {row['status']} read={self.read} created={self.created} parked={self.parked} errors={len(self.errors)} ai_calls={row['ai_calls']} :: {summ[:160]}")
         return self.id
+
+
+def mark_crashed(sb):
+    """Rows still 'running' long after they started belong to a run that died (timeout, kill, crash)."""
+    if sb.dry:
+        return 0
+    cutoff = iso(now_utc() - timedelta(minutes=CRASH_AFTER_MIN))
+    qs = urllib.parse.urlencode({"owner_id": "eq." + OWNER_ID, "status": "eq.running", "started_at": "lt." + cutoff})
+    st, d = http("PATCH", sb.url + "agent_runs?" + qs,
+                 {"status": "crashed", "error_kinds": ["other"],
+                  "errors": [{"stage": "runner", "error": f"run never finished (still running after {CRASH_AFTER_MIN} min): killed, timed out or crashed"}]},
+                 headers=dict(sb.h, Prefer="return=representation"))
+    n = len(d) if st < 300 and isinstance(d, list) else 0
+    if n:
+        log(f"marked {n} unfinished run(s) as crashed")
+    return n
+
+
+def health_alerts(sb, tg, settings, agents):
+    """Telegram, at most once a day per agent and reason, never in quiet hours (the next run after quiet hours sends it)."""
+    chat = settings.get("telegram_chat_id")
+    if not chat:
+        return []
+    since = iso(now_utc() - timedelta(days=3))
+    rows = sb.select("agent_runs", {"owner_id": "eq." + OWNER_ID, "started_at": "gte." + since,
+                                    "select": "agent,status,error_kinds,errors,started_at", "order": "started_at.desc", "limit": "400"})
+    by = {}
+    for r in rows:
+        if r.get("status") in ("running", None):
+            continue
+        by.setdefault(r["agent"], []).append(r)
+    alerts = []
+    for ag, rs in by.items():
+        last3 = rs[:3]
+        if len(last3) == 3 and all(r.get("status") in ("failed", "crashed") for r in last3):
+            e = (last3[0].get("errors") or [{}])[0]
+            txt = str(e.get("error") if isinstance(e, dict) else e)[:160]
+            alerts.append((ag, "fails", f"⚠️ <b>{html.escape(ag)}</b> failed 3 runs in a row.\nLast error ({', '.join(last3[0].get('error_kinds') or ['other'])}): {html.escape(txt)}"))
+        elif len(rs) >= 2 and all("setup" in (r.get("error_kinds") or []) for r in rs[:2]):
+            e = (rs[0].get("errors") or [{}])[0]
+            txt = str(e.get("error") if isinstance(e, dict) else e)[:160]
+            alerts.append((ag, "setup", f"🔧 <b>{html.escape(ag)}</b> needs you: a setup error twice in a row (key, credits or access). Waiting will not fix it.\n{html.escape(txt)}"))
+    # missed slots, from the Agents screen schedule (the runner itself running proves every-pass agents are not missed)
+    run_name = {"status_sync": "status_sync", "sweeps": "sweeps", "resume_decider": "resume_decider", "jd_fetcher": "sourcer+fit",
+                "sourcer": "sourcer+fit", "fit": "sourcer+fit", "notifier": "notifier"}
+    for key, cfg in (agents or {}).items():
+        if not cfg.get("enabled") or cfg.get("built_status") == "not_built":
+            continue
+        sch = cfg.get("schedule") or {}
+        mode = sch.get("mode", "every_run")
+        limit_h = 30 if mode == "nightly" else (1.5 * float(sch.get("hours") or 4) + 2 if mode == "every_n_hours" else None)
+        if not limit_h:
+            continue
+        last = cfg.get("last_run_at")
+        name = run_name.get(key, key)
+        if not last:
+            continue
+        try:
+            age_h = (now_utc() - datetime.fromisoformat(last.replace("Z", "+00:00"))).total_seconds() / 3600
+        except Exception:
+            continue
+        if age_h > limit_h:
+            alerts.append((name, "missed", f"⏰ <b>{html.escape(cfg.get('name') or key)}</b> missed its slot: last ran {age_h:.0f} h ago (expected within {limit_h:.0f} h)."))
+    if not alerts:
+        return []
+    if in_quiet_hours(settings):
+        log(f"{len(alerts)} agent alert(s) held for quiet hours")
+        return []
+    sent_map = dict(settings.get("agent_alerts") or {})
+    day = today_ist().isoformat()
+    out = []
+    for ag, why, text in alerts:
+        k = f"{ag}|{why}"
+        if sent_map.get(k) == day:
+            continue
+        tg.send(chat, text + f"\n{APP_URL}#runs")
+        sent_map[k] = day
+        out.append(k)
+    if out and not sb.dry:
+        settings.set(agent_alerts=sent_map)
+    return out
 
 
 # ---------------------------------------------------------------- Prompts
@@ -1458,15 +1608,20 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None, agents=None, llm_f
         for l in new_leads:
             for k in keys:
                 l.setdefault(k, 0 if k == "jd_fetch_attempts" else None)
+        if run.id and not sb.dry:
+            for l in new_leads:
+                l["agent_run_id"] = run.id
         rows = sb.insert("leads", new_leads)
         run.created = len(rows)
         for aid in {l["alert_definition_id"] for l in new_leads if l.get("alert_definition_id")}:
             sb.update("alert_definitions", {"id": aid}, {"last_lead_at": iso(now_utc())})
 
-    # 6) JD backlog (v1.0.8): earlier leads and open applications that still have no JD
+    # 6) JD backlog (v1.0.8): earlier leads and open applications that still have no JD.
+    #    v1.0.14: OFF by default (Sudharsan, 20 Oct). Only new leads get a JD. Turn back on with user_settings.settings.jd_backlog = true.
     try:
-        jd_backlog(sb, llm_fit, settings, run, streams, docs, getattr(run, "jd_budget", None) or JDBudget(dry=sb.dry, limit=0),
-                   skip={l.get("dedup_key") for l in new_leads}, agents=agents, rubrics=rubrics, do_fit=do_fit)
+        if settings.get("jd_backlog") is True:
+          jd_backlog(sb, llm_fit, settings, run, streams, docs, getattr(run, "jd_budget", None) or JDBudget(dry=sb.dry, limit=0),
+                     skip={l.get("dedup_key") for l in new_leads}, agents=agents, rubrics=rubrics, do_fit=do_fit)
     except Exception as e:
         run.errors.append({"stage": "jd_backlog", "error": str(e)[:300]})
     return new_leads
@@ -2190,6 +2345,7 @@ def main():
         sb = DrySupabase()
         llm = LLM(Gemini("", model, dry=True))
         llm.jev = Jev("", dry=True)
+        PROVIDERS.update(gemini=llm.gem, groq=llm.groq, jev=llm.jev)
         tg = Telegram("dry", dry=True)
         tg.dry_updates = [{"update_id": 101, "callback_query": {"id": "cq1", "data": "ag|lead-old", "message": {"message_id": 7, "chat": {"id": 1}}}},
                           {"update_id": 102, "callback_query": {"id": "cq2", "data": "tl|lead-old", "message": {"message_id": 8, "chat": {"id": 1}}}},
@@ -2215,12 +2371,17 @@ def main():
         llm = LLM(gem, groq)
         llm.jev = Jev(os.environ["AI_GATEWAY_API_KEY"]) if os.environ.get("AI_GATEWAY_API_KEY") else None
         log("jev: " + (f"on ({llm.jev.model})" if llm.jev else "off (no AI_GATEWAY_API_KEY secret)"))
+        PROVIDERS.update(gemini=gem, groq=groq, jev=llm.jev)
         tg = Telegram(env["TELEGRAM_BOT_TOKEN"])
         gmail = Gmail(env["GMAIL_USER"], env["GMAIL_APP_PASSWORD"]).connect()
         fixtures = None
 
     failures = 0
     agents = load_agents(sb)
+    try:
+        mark_crashed(sb)
+    except Exception as e:
+        log(f"crash check failed: {e}")
     try:
         if args.mode == "evals":
             run_evals(sb, llm, agents, settings, max_runs=3)
@@ -2239,6 +2400,11 @@ def main():
             else:
                 failures += nightly(sb, gmail, llm, tg, settings, model, agents, fixtures)
     finally:
+        try:
+            if args.mode in ("run", "nightly"):
+                health_alerts(sb, tg, settings, load_agents(sb) if not dry else agents)
+        except Exception as e:
+            log(f"agent alerts failed: {e}")
         try:
             record_usage(settings, llm, tg, dry)
         except Exception as e:
@@ -2369,6 +2535,7 @@ def cycle(sb, gmail, llm, tg, settings, model, agents, fixtures):
             r.errors.append({"stage": "notifier", "error": str(e)[:300]}); failures += 1
     else:
         r.notes.append("notifier: " + why_n + " (no pushes)")
+        r.skipped = True
     r.finish()
     mark(sb, agents, "notifier", do_n, ("ran with errors" if r.errors else "ran") if do_n else "skipped: " + why_n)
     r = Run(sb, "replies", "-")   # your button taps are always processed
@@ -2396,6 +2563,7 @@ def nightly(sb, gmail, llm, tg, settings, model, agents=None, fixtures=None):
             r.errors.append({"stage": "status_sync", "error": str(e)[:300]}); failures += 1
     else:
         r.notes.append("status sync: " + why_s)
+        r.skipped = True
     r.model = llm_s.label
     r.finish(llm_s)
     mark(sb, agents, "status_sync", do_s, ("ran with errors" if r.errors else "ran") if do_s else "skipped: " + why_s)
@@ -2409,6 +2577,7 @@ def nightly(sb, gmail, llm, tg, settings, model, agents=None, fixtures=None):
             r.errors.append({"stage": "sweeps", "error": str(e)[:300]}); failures += 1
     else:
         r.notes.append("sweeps: " + why_w)
+        r.skipped = True
         waiting = len(sb.select("leads", {"owner_id": "eq." + OWNER_ID, "status": "eq.fit_checked", "select": "id"}))
     r.finish()
     mark(sb, agents, "sweeps", do_w, ("ran with errors" if r.errors else "ran") if do_w else "skipped: " + why_w)
