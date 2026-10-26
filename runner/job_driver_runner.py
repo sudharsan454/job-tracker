@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0.16 · 25 Oct 2026 · v1.0.16: (a) the nightly digest no longer reports alerts that brought no leads ("No leads 7d" lines are gone), and on a night with nothing to act on (nothing ghosted, stale, overdue or debrief pending; parking old leads alone does not count) no digest is sent at all; (b) every failed or crashed agent run sends a Telegram message: one message per failure streak per agent (not one every pass), a one-line "working again" when it recovers, and failures during quiet hours are reported after quiet hours end. The old "3 failures in a row" and "setup error twice" alerts are folded into this; missed-slot alerts are unchanged. v1.0.15: Jev called DIRECTLY on TypeSafe (POST https://api.typesafe.ai/v1/systemone, model jev-latest, secret TYPESAFE_API_KEY or TYPEFACE_API_KEY or JEV_API_KEY); yes/no questions sent as "noul" and read back into the same shape; Vercel AI Gateway (AI_GATEWAY_API_KEY) only when no direct key is set; Jev cost estimated from tokens. v1.0.14: the JD backlog (filling job descriptions for earlier leads and open applications) is off by default; only new leads get a JD. Switch back on with user_settings.settings.jd_backlog = true. v1.0.13: agent run log. Every agent run writes its agent_runs row when it STARTS (status running) and fills it in at the end with status (success / partial / failed / skipped), error kinds (ai_busy, ai_limit, setup, format, network, gmail, jd_fetch, other), AI calls made, whether the Groq backup was used, and a link to the GitHub run. A row still 'running' after 40 minutes is marked crashed at the start of the next pass. Leads created by the sourcer carry agent_run_id. Telegram alert, at most once a day per agent and never in quiet hours, when an agent fails or crashes 3 runs in a row, hits a setup error twice in a row, or misses its slot (nightly agents after 30 h, every-N-hours agents after 1.5x N + 2 h). v1.0.12: Resume Decider no longer spends a lead's 3 tries on outages (Jev 402/403 no credits, Gemini/Groq 429/503, no model left); it stops for the run, leaves the lead "not yet run" with the reason, and retries next pass. After the first Jev "no credits" reply, Jev is skipped for the rest of the run. v1.0.11: Jev (TypeSafe, via Vercel AI Gateway, secret AI_GATEWAY_API_KEY) as the judge for the new Resume Decider (picklist generic / tailored / not_run / failed on leads; per-stream criteria from the Agents screen; Jev scores each criterion, code applies weights and threshold; Gemini/Groq as backup; low-confidence flag; Failed after 3 tries) and as a shadow fit scorer (leads.fit_shadow, never used for decisions until it passes the eval gate). v1.0.10: fit replies are normalised before the format check (a bare list of scores, a single score object, or scores under "results"/"jobs" are accepted), and a reply that still fails is logged with its first 200 characters. v1.0.9: JD Fetcher (v1.0.8) merged with the agents config. Reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. The JD Fetcher has its own agent row (on/off, max pages per run); JD re-scoring uses the rubric; fit batch defaults to 4. Falls back to built-in behaviour if the agents table cannot be read. v1.0.8: JD Fetcher. Every live lead gets its full job description (LinkedIn public job page, no login; else the company's own apply/careers page via JSON-LD or page text) saved in leads.jd_text before Fit runs, and Fit now scores against the JD (batches of 4). Earlier leads and open applications without a JD are filled in later runs (max 3 tries each, then jd_confidence=fetch_failed). Leads already scored get re-scored once their JD lands. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
+# Job Application Driver · permanent runner · v1.0.17 · 27 Oct 2026 · v1.0.17: mandatory gates per stream (rubric.gates: location, years asked, product role, or any yes/no question) checked BEFORE weighted fit; a failed gate parks the lead with the reason, a gate the job does not state lets it through with a flag; experience graded by rule from the years the JD asks for; Jev questions ask about the job only (rubric param 'ask', plain levels); gate sweep re-checks and re-scores live leads on the active rubric; career notes synthesised daily from the portfolio (settings.career_notes_auto) plus your Extra notes. v1.0.16 · 25 Oct 2026 · v1.0.16: (a) the nightly digest no longer reports alerts that brought no leads ("No leads 7d" lines are gone), and on a night with nothing to act on (nothing ghosted, stale, overdue or debrief pending; parking old leads alone does not count) no digest is sent at all; (b) every failed or crashed agent run sends a Telegram message: one message per failure streak per agent (not one every pass), a one-line "working again" when it recovers, and failures during quiet hours are reported after quiet hours end. The old "3 failures in a row" and "setup error twice" alerts are folded into this; missed-slot alerts are unchanged. v1.0.15: Jev called DIRECTLY on TypeSafe (POST https://api.typesafe.ai/v1/systemone, model jev-latest, secret TYPESAFE_API_KEY or TYPEFACE_API_KEY or JEV_API_KEY); yes/no questions sent as "noul" and read back into the same shape; Vercel AI Gateway (AI_GATEWAY_API_KEY) only when no direct key is set; Jev cost estimated from tokens. v1.0.14: the JD backlog (filling job descriptions for earlier leads and open applications) is off by default; only new leads get a JD. Switch back on with user_settings.settings.jd_backlog = true. v1.0.13: agent run log. Every agent run writes its agent_runs row when it STARTS (status running) and fills it in at the end with status (success / partial / failed / skipped), error kinds (ai_busy, ai_limit, setup, format, network, gmail, jd_fetch, other), AI calls made, whether the Groq backup was used, and a link to the GitHub run. A row still 'running' after 40 minutes is marked crashed at the start of the next pass. Leads created by the sourcer carry agent_run_id. Telegram alert, at most once a day per agent and never in quiet hours, when an agent fails or crashes 3 runs in a row, hits a setup error twice in a row, or misses its slot (nightly agents after 30 h, every-N-hours agents after 1.5x N + 2 h). v1.0.12: Resume Decider no longer spends a lead's 3 tries on outages (Jev 402/403 no credits, Gemini/Groq 429/503, no model left); it stops for the run, leaves the lead "not yet run" with the reason, and retries next pass. After the first Jev "no credits" reply, Jev is skipped for the rest of the run. v1.0.11: Jev (TypeSafe, via Vercel AI Gateway, secret AI_GATEWAY_API_KEY) as the judge for the new Resume Decider (picklist generic / tailored / not_run / failed on leads; per-stream criteria from the Agents screen; Jev scores each criterion, code applies weights and threshold; Gemini/Groq as backup; low-confidence flag; Failed after 3 tries) and as a shadow fit scorer (leads.fit_shadow, never used for decisions until it passes the eval gate). v1.0.10: fit replies are normalised before the format check (a bare list of scores, a single score object, or scores under "results"/"jobs" are accepted), and a reply that still fails is logged with its first 200 characters. v1.0.9: JD Fetcher (v1.0.8) merged with the agents config. Reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. The JD Fetcher has its own agent row (on/off, max pages per run); JD re-scoring uses the rubric; fit batch defaults to 4. Falls back to built-in behaviour if the agents table cannot be read. v1.0.8: JD Fetcher. Every live lead gets its full job description (LinkedIn public job page, no login; else the company's own apply/careers page via JSON-LD or page text) saved in leads.jd_text before Fit runs, and Fit now scores against the JD (batches of 4). Earlier leads and open applications without a JD are filled in later runs (max 3 tries each, then jd_confidence=fetch_failed). Leads already scored get re-scored once their JD lands. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -1249,12 +1249,296 @@ def score_items(llm, agents, stream, resume, items, rubric, run, stage):
             run.errors.append({"stage": stage, "stream": stream["name"], "error": str(e)[:300]})
             continue
         res = fit_results(out, rub, len(batch), {**meta, "model": llm.label if hasattr(llm, "label") else None})
+        if rub:
+            for k in list(res):
+                score, fb = res[k]
+                if isinstance(fb, dict) and isinstance(fb.get("params"), dict):
+                    score, caps = apply_rule_params(rub, batch[k], fb["params"])
+                    fb["caps_applied"] = caps
+                    res[k] = (score, fb)
         for k, (score, fb) in res.items():
             if rub and guard_on(cfg, "require_basis", True) and not (fb or {}).get("basis"):
                 run.errors.append({"stage": stage, "guardrail": "require_basis", "title": batch[k].get("title"), "error": "score came back without a basis"})
                 fb["basis"] = "not given"
             out_all[i + k] = (score, fb)
     return out_all
+
+
+# runner_gates_module_v1.0.py · v1.0 · 27 Oct 2026 · inserted into runner v1.0.17
+# Mandatory gates (pass / fail / not_stated) checked before weighted fit; rule-based experience grade; career notes from the portfolio.
+
+GATE_FAIL_P = 0.2          # an AI-checked gate fails only when P(yes) < 0.2, i.e. at least 80% sure it is a mismatch
+FOREIGN_WORDS = ("united states", "usa", " us", "u.s.", "united kingdom", " uk", "europe", "emea", "canada", "australia", "singapore",
+                 "germany", "dubai", "uae", "london", "new york", "san francisco", "berlin", "amsterdam", "philippines", "apac", "americas")
+ROLE_PASS_RE = re.compile(r"product\s+(manager|management|owner|lead|leader|head)|\b(a?pm|gpm|spm)\b|head\s+of\s+product|director\s+of\s+product|"
+                          r"\bvp,?\s+(of\s+)?product|chief\s+product|group\s+product|principal\s+product|product\s+director", re.I)
+ROLE_FAIL_RE = re.compile(r"product\s+marketing|engineer|developer|architect|scientist|designer|analyst|project\s+manager|program(me)?\s+manager|scrum|"
+                          r"delivery\s+manager|sales|account\s+(executive|manager)|marketing|customer\s+success|support|recruit|tester|\bqa\b|devops|consultant", re.I)
+YEARS_RANGE_RE = re.compile(r"(\d{1,2})\s*\+?\s*(?:-|–|—|to)\s*(\d{1,2})\s*\+?\s*(?:years?|yrs?)", re.I)
+YEARS_MIN_RE = re.compile(r"(\d{1,2})\s*(\+|plus)?\s*(?:years?|yrs?)", re.I)
+
+
+def years_asked(text):
+    """(lo, hi) years of experience the job asks for, hi None for 'X+'; None when not stated. Only counts numbers near the word 'experience'."""
+    t = text or ""
+    for rx, ranged in ((YEARS_RANGE_RE, True), (YEARS_MIN_RE, False)):
+        for m in rx.finditer(t):
+            win = t[max(0, m.start() - 60):m.end() + 80].lower()
+            if "experience" not in win and "exp " not in win and "exp." not in win:
+                continue
+            lo = int(m.group(1))
+            if lo > 30:
+                continue
+            if ranged:
+                hi = int(m.group(2))
+                if hi < lo or hi > 40:
+                    continue
+                return lo, hi
+            return lo, None
+    return None
+
+
+def _overlap(lo, hi, a, b):
+    return lo <= b and (hi is None or hi >= a)
+
+
+def gate_location(g, lead):
+    loc = (lead.get("location") or "").lower()
+    cities = [c.lower() for c in ((g.get("rule") or {}).get("allow_cities") or ["chennai"])]
+    if not loc.strip() or loc.strip() in ("india", "in", "anywhere"):
+        return "not_stated", "location not given"
+    if any(c in loc for c in cities):
+        return "pass", lead.get("location")
+    if "remote" in loc or "work from home" in loc or "wfh" in loc:
+        padded = " " + loc + " "
+        if "india" not in loc and any(w in padded for w in FOREIGN_WORDS):
+            return "fail", "remote outside India: " + lead.get("location")
+        return "pass", "remote: " + lead.get("location")
+    return "fail", lead.get("location")
+
+
+def gate_years(g, lead):
+    r = g.get("rule") or {}
+    mn, mx = float(r.get("min", 0)), float(r.get("max", 99))
+    ya = years_asked((lead.get("jd_text") or "") + "\n" + (lead.get("raw_snippet") or lead.get("snippet") or ""))
+    if not ya:
+        return "not_stated", "years not stated"
+    lo, hi = ya
+    txt = f"{lo}+ years" if hi is None else f"{lo}-{hi} years"
+    return ("pass" if _overlap(lo, hi, mn, mx) else "fail"), txt
+
+
+def gate_title(g, lead):
+    t = lead.get("title") or ""
+    if re.search(r"product\s+marketing", t, re.I):
+        return "fail", t
+    if ROLE_PASS_RE.search(t):
+        return "pass", t
+    if ROLE_FAIL_RE.search(t):
+        return "fail", t
+    return "unclear", t
+
+
+def gate_ai(g, lead, jev):
+    """Yes/no question to Jev about the job only. Fail only when Jev is at least 80% sure the answer is no."""
+    if not jev or getattr(jev, "blocked", None):
+        return "not_stated", "no AI check available"
+    st = {"job": {"title": lead.get("title"), "company": lead.get("company"), "location": lead.get("location"),
+                  "job_description": ((lead.get("jd_text") or lead.get("raw_snippet") or "")[:JEV_JD_CHARS] or "not fetched")}}
+    try:
+        ans = jev.evaluate(st, {"g": {"type": "boolean", "instructions": g.get("ask") or g.get("description") or g.get("name"),
+                                      "criteria": {"true": g.get("pass") or "yes", "false": g.get("fail") or "no"}}}, timeout=45)
+        p = float((ans.get("g") or {}).get("probability"))
+    except Exception as e:
+        return "not_stated", "AI check failed: " + str(e)[:80]
+    if p < GATE_FAIL_P:
+        return "fail", f"Jev p(yes)={p:.2f}"
+    return ("pass" if p >= 0.5 else "not_stated"), f"Jev p(yes)={p:.2f}"
+
+
+def check_gates(rub, lead, jev=None):
+    """Returns (failed_gate_name or None, {key: {result, why}}). 'not_stated' always lets the job through unless the gate says if_unknown=fail."""
+    res, failed = {}, None
+    for g in (rub or {}).get("gates") or []:
+        if g.get("enabled") is False:
+            continue
+        typ = (g.get("rule") or {}).get("type")
+        if typ == "location":
+            r, why = gate_location(g, lead)
+        elif typ == "years":
+            r, why = gate_years(g, lead)
+        elif typ == "title":
+            r, why = gate_title(g, lead)
+            if r == "unclear":
+                r, why = gate_ai(g, lead, jev)
+        else:
+            r, why = gate_ai(g, lead, jev)
+        if r == "not_stated" and g.get("if_unknown") == "fail":
+            r = "fail"
+        res[g["key"]] = {"result": r, "why": str(why or "")[:120]}
+        if r == "fail" and not failed:
+            failed = g.get("name") or g["key"]
+    return failed, res
+
+
+def gate_reason(failed, res, rub):
+    g = next((x for x in (rub or {}).get("gates") or [] if (x.get("name") or x["key"]) == failed), {})
+    why = (res.get(g.get("key")) or {}).get("why") or ""
+    return f"Failed: {failed}" + (f" ({why[:60]})" if why else "")
+
+
+def rule_param_scores(rub, lead):
+    """Weighted params that code scores from the job itself (rule: years_grade). {key: score or None}."""
+    out = {}
+    for p in (rub or {}).get("params") or []:
+        r = p.get("rule") or {}
+        if p.get("enabled") is False or r.get("type") != "years_grade":
+            continue
+        ya = years_asked((lead.get("jd_text") or "") + "\n" + (lead.get("raw_snippet") or lead.get("snippet") or ""))
+        if not ya:
+            out[p["key"]] = None
+            continue
+        lo, hi = ya
+        hb, mb = r.get("high") or [8, 10], r.get("mid") or [6, 11]
+        out[p["key"]] = 90 if _overlap(lo, hi, hb[0], hb[1]) else (50 if _overlap(lo, hi, mb[0], mb[1]) else 10)
+    return out
+
+
+def apply_rule_params(rub, lead, params):
+    """Override AI scores for rule params when the rule could read the job; recompute total and caps."""
+    rp = rule_param_scores(rub, lead)
+    for k, v in rp.items():
+        if v is not None:
+            params[k] = {"score": v, "why": "from the years the job asks for (rule)"}
+    return compute_fit(rub, params)
+
+
+def gate_leads(leads, rubrics, noise, run, jev=None):
+    """Mark leads that fail a gate as parked (in place). Returns the leads that passed."""
+    passed = []
+    for l in leads:
+        rv = rubrics.get(l.get("job_stream_id"))
+        rub = (rv or {}).get("rubric") or {}
+        if not rub.get("gates"):
+            passed.append(l)
+            continue
+        failed, res = check_gates(rub, l, jev)
+        fb = dict(l.get("fit_breakdown") or {})
+        fb["gates"] = res
+        l["fit_breakdown"] = fb
+        if failed:
+            reason = gate_reason(failed, res, rub)
+            l["status"], l["noise_reason_id"], l["matched_criterion"] = "parked", noise.get("Failed mandatory gate"), reason[:200]
+            run.parked += 1
+            run.notes.append(f"gate: {l.get('company')} · {l.get('title')} → {reason}"[:200])
+        else:
+            passed.append(l)
+    return passed
+
+
+def gate_sweep(sb, llm, agents, settings, run, jev=None, limit=8):
+    """Leads still live (new / fit_checked, last 21 days) that were scored on an older rubric: run the gates, park failures,
+    re-score the rest on the active rubric (up to `limit` per run, the rest on later runs). Promoted leads are never parked."""
+    streams, docs, _, _, _, noise = load_context(sb)
+    rubrics = load_rubrics(sb, streams)
+    live = sb.select("leads", {"owner_id": "eq." + OWNER_ID, "status": "in.(new,fit_checked)", "created_at": "gte." + iso(now_utc() - timedelta(days=21)),
+                               "select": "id,title,company,location,raw_snippet,jd_text,job_stream_id,fit_breakdown,status", "order": "created_at.desc", "limit": "200"})
+    todo = []
+    for l in live:
+        rv = rubrics.get(l.get("job_stream_id"))
+        if not rv or not ((rv.get("rubric") or {}).get("gates")):
+            continue
+        if (l.get("fit_breakdown") or {}).get("rubric_version") == rv.get("version") and "gates" in (l.get("fit_breakdown") or {}):
+            continue
+        todo.append(l)
+    if not todo:
+        return 0
+    parked = n = 0
+    keep = []
+    for l in todo:
+        before = run.parked
+        gate_leads([l], rubrics, noise, run, jev)
+        if run.parked > before:
+            sb.update("leads", {"id": l["id"]}, {"status": "parked", "noise_reason_id": l.get("noise_reason_id"), "matched_criterion": l.get("matched_criterion"),
+                                                  "fit_breakdown": l["fit_breakdown"]})
+            parked += 1
+        else:
+            keep.append(l)
+    for s in streams:
+        items = [l for l in keep if l.get("job_stream_id") == s["id"]][:limit]
+        resume = resume_for(s, docs)
+        if not items or not resume or llm.gave_up_429:
+            continue
+        thr = stream_threshold(rubrics, settings, s["id"])
+        res = score_items(llm, agents, s, resume, items, rubrics.get(s["id"]), run, "gate_sweep")
+        for k, (fs, fb) in res.items():
+            fb = dict(fb or {}); fb["gates"] = (items[k].get("fit_breakdown") or {}).get("gates")
+            patch = {"fit_score": fs, "fit_breakdown": fb, "fit_shadow": None}
+            if fs is not None and fs < thr:
+                patch.update(status="parked", noise_reason_id=noise.get("Fit below threshold"), matched_criterion="Fit below threshold")
+            sb.update("leads", {"id": items[k]["id"]}, patch)
+            n += 1
+    run.notes.append(f"gate sweep: {parked} parked by a gate, {n} re-scored on the new rubric, {max(0, len(keep) - n)} left for later")
+    return parked + n
+
+
+PORTFOLIO_RAW = "https://raw.githubusercontent.com/sudharsan454/sudharsan454.github.io/main/"
+NOTES_SYS = ("You turn a product manager's portfolio website text into career notes for a job-matching system. "
+             "Write plain bullet lines, no marketing words. Cover: years and titles, products owned and what they did, measurable results, "
+             "domains and markets worked in, team size and leadership, technical depth (AI, data, platforms), go-to-market work, and anything a resume might underplay. "
+             "Only facts stated in the text. Max 2500 characters. Output JSON {\"notes\": \"...\"}.")
+
+
+def portfolio_text():
+    pages = ["index.html"]
+    try:
+        st, d = http("GET", "https://api.github.com/repos/sudharsan454/sudharsan454.github.io/contents/work", None, timeout=20)
+        if st < 300 and isinstance(d, list):
+            pages += ["work/" + x["name"] for x in d if str(x.get("name", "")).endswith(".html")][:8]
+    except Exception:
+        pass
+    out = []
+    for p in pages:
+        try:
+            req = urllib.request.Request(PORTFOLIO_RAW + p, headers={"User-Agent": "job-driver"})
+            raw = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "ignore")
+        except Exception:
+            continue
+        raw = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw)
+        txt = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw))).strip()
+        out.append(f"[{p}] {txt[:6000]}")
+    return "\n\n".join(out)[:24000]
+
+
+def career_notes_refresh(llm, settings, run):
+    """Once a day: read the portfolio and store a synthesis in settings.career_notes_auto. Your own Extra notes stay in settings.career_notes."""
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    if settings.get("career_notes_auto_date") == today:
+        return False
+    txt = portfolio_text()
+    if not txt:
+        run.notes.append("career notes: portfolio not readable")
+        return False
+    notes = None
+    try:
+        out = llm_json_checked(llm, NOTES_SYS, txt, lambda o: isinstance(o, dict) and isinstance(o.get("notes"), str))
+        notes = out["notes"].strip()[:3000]
+    except Exception as e:
+        run.errors.append({"stage": "career_notes", "error": str(e)[:200]})
+    if not notes:
+        notes = txt[:3000]
+    settings.set(career_notes_auto=notes, career_notes_auto_date=today, career_notes_auto_source="sudharsan454.github.io")
+    run.notes.append(f"career notes: refreshed from the portfolio ({len(notes)} chars)")
+    return True
+
+
+def career_notes_all(settings):
+    a, b = (settings.get("career_notes_auto") or "").strip(), (settings.get("career_notes") or "").strip()
+    return ("From portfolio:\n" + a if a else "") + ("\n\nExtra notes:\n" + b if b else "")
+
+
+def _jev_of(x):
+    return getattr(x, 'jev', None) or getattr(getattr(x, 'base', None), 'jev', None)
 
 
 def fit_backlog(sb, llm, agents, settings, run, exclude_keys=()):
@@ -1273,8 +1557,18 @@ def fit_backlog(sb, llm, agents, settings, run, exclude_keys=()):
         if not items or not resume or llm.gave_up_429:
             continue
         thr = stream_threshold(rubrics, settings, s["id"])
+        before = run.parked
+        passed = gate_leads(items, rubrics, noise, run, _jev_of(llm))
+        for l in items:
+            if l not in passed:
+                sb.update("leads", {"id": l["id"]}, {"status": "parked", "noise_reason_id": l.get("noise_reason_id"), "matched_criterion": l.get("matched_criterion"), "fit_breakdown": l.get("fit_breakdown")})
+        items = passed
+        if not items:
+            continue
         res = score_items(llm, agents, s, resume, items, rubrics.get(s["id"]), run, "fit_backlog")
         for k, (fs, fb) in res.items():
+            if isinstance(fb, dict) and (items[k].get("fit_breakdown") or {}).get("gates"):
+                fb["gates"] = items[k]["fit_breakdown"]["gates"]
             patch = {"fit_score": fs, "fit_breakdown": fb, "status": "fit_checked"}
             if fs is not None and fs < thr:
                 patch.update(status="parked", noise_reason_id=noise.get("Fit below threshold"), matched_criterion="Fit below threshold")
@@ -1623,6 +1917,9 @@ def sourcer(sb, gmail, llm, settings, run, dry_fixtures=None, agents=None, llm_f
             l.update(jd_text=r["text"], jd_source_url=r["source_url"], jd_confidence=r["confidence"], jd_fetched_at=iso(now_utc()))
     if jdb.n:
         run.notes.append(f"JD: {jdb.ok} fetched, {jdb.failed} failed for new leads")
+
+    # 2c) mandatory gates (v1.0.17): a failed gate parks the lead before any scoring
+    gate_leads([l for l in new_leads if l["status"] == "new"], rubrics, noise, run, _jev_of(llm_fit) or _jev_of(llm))
 
     # 3) fit scoring for live leads, per stream (rubric from the Agents screen; batch size = Fit "max items")
     live = [l for l in new_leads if l["status"] == "new"]
@@ -2114,9 +2411,11 @@ def jev_rubric_questions(rub):
     for p in (rub or {}).get("params") or []:
         if p.get("enabled") is False:
             continue
+        if (p.get("rule") or {}).get("type") == "years_grade" or float(p.get("weight") or 0) == 0:
+            continue
         a = p.get("anchors") or {}
-        qs["s_" + p["key"]] = {"type": "score", "instructions": f'{p.get("name")}: {p.get("description") or ""}',
-                               "criteria": [f'about 10: {a.get("low") or "low"}', f'about 50: {a.get("mid") or "medium"}', f'about 90: {a.get("high") or "high"}']}
+        qs["s_" + p["key"]] = {"type": "score", "instructions": p.get("ask") or f'Look only at THE JOB (title and job description), not the candidate. {p.get("name")}: {p.get("description") or ""}',
+                               "criteria": [a.get("low") or "low", a.get("mid") or "medium", a.get("high") or "high"]}
         qs["k_" + p["key"]] = {"type": "boolean", "instructions": f'Is there enough information here to judge "{p.get("name")}"?',
                                "criteria": {"true": "the details given are enough to judge it", "false": "key details are missing (for example only a job title is known, or no career notes are given)"}}
     return qs
@@ -2169,7 +2468,7 @@ def fit_shadow(sb, jev, run, limit=20):
     streams, docs, _, _, _, _ = load_context(sb)
     rubrics = load_rubrics(sb, streams)
     try:
-        leads = sb.select("leads", {"owner_id": "eq." + OWNER_ID, "fit_score": "not.is.null", "fit_shadow": "is.null", "created_at": "gte." + iso(now_utc() - timedelta(days=21)),
+        leads = sb.select("leads", {"owner_id": "eq." + OWNER_ID, "fit_score": "not.is.null", "fit_shadow": "is.null", "status": "in.(new,fit_checked,promoted)", "created_at": "gte." + iso(now_utc() - timedelta(days=21)),
                                     "select": "id,title,company,location,raw_snippet,jd_text,job_stream_id", "order": "created_at.desc", "limit": str(limit)})
     except Exception as e:
         run.notes.append(f"fit shadow: leads not readable ({str(e)[:80]})")
@@ -2189,7 +2488,7 @@ def fit_shadow(sb, jev, run, limit=20):
                 break
             continue
         params = jev_param_scores(rub, ans)
-        total, caps = compute_fit(rub, params)
+        total, caps = apply_rule_params(rub, l, params)
         sb.update("leads", {"id": l["id"]}, {"fit_shadow": {"engine": "jev", "model": jev.model, "score": total, "params": params, "caps_applied": caps,
                                                             "rubric_version": rv.get("version"), "at": iso(now_utc())}})
         n += 1
@@ -2235,7 +2534,7 @@ def resume_decider(sb, llm, agents, settings, run):
         targets = {(t.get("name") or "").strip().lower() for t in sb.select("target_companies", {"owner_id": "eq." + OWNER_ID, "select": "name"})}
     except Exception:
         targets = set()
-    notes = settings.get("career_notes") or ""
+    notes = career_notes_all(settings)
     margin = guard_value(cfg, "low_confidence_ask", 8)
     max_tries = int(guard_value(cfg, "max_attempts", 3) or 3)
     order = [(cfg.get("model") or {}).get("primary") or "jev", (cfg.get("model") or {}).get("fallback") or "gemini"]
@@ -2586,6 +2885,14 @@ def source_and_fit(sb, gmail, llm, settings, model, agents, fixtures, phase):
             fit_backlog(sb, llm_f, agents, settings, r, exclude_keys={l.get("dedup_key") for l in new})
         except Exception as e:
             r.errors.append({"stage": "fit_backlog", "error": str(e)[:300], "trace": traceback.format_exc()[-800:]}); failures += 1
+        try:
+            gate_sweep(sb, llm_f, agents, settings, r, jev=_jev_of(llm))
+        except Exception as e:
+            r.errors.append({"stage": "gate_sweep", "error": str(e)[:300], "trace": traceback.format_exc()[-800:]}); failures += 1
+    try:
+        career_notes_refresh(llm_f, settings, r)
+    except Exception as e:
+        r.errors.append({"stage": "career_notes", "error": str(e)[:300]})
     else:
         r.notes.append("fit: " + why_fit)
     r.model = "/".join(x for x in (llm_x.label, llm_f.label) if x != "-") or "-"
@@ -2687,7 +2994,7 @@ class DrySupabase(Supabase):
             "job_boards": [{"id": "b-li", "name": "LinkedIn", "kind": "portal"}, {"id": "b-nk", "name": "Naukri", "kind": "portal"}],
             "alert_definitions": [{"id": "al1", "job_stream_id": PM_STREAM, "sender_pattern": "from:jobs-noreply@linkedin.com", "query_text": "Product Manager", "last_lead_at": None}],
             "filter_criteria": [{"criterion_type": "title_exclude", "value": "Project Manager", "job_stream_id": None}, {"criterion_type": "location_allow", "value": "Chennai", "job_stream_id": None}, {"criterion_type": "location_allow", "value": "Remote", "job_stream_id": None}],
-            "noise_reasons": [{"id": "n1", "reason": "Title excluded"}, {"id": "n2", "reason": "Location not allowed"}, {"id": "n3", "reason": "Fit below threshold"}, {"id": "n4", "reason": "Older than 14 days"}, {"id": "n5", "reason": "Parked by you"}],
+            "noise_reasons": [{"id": "n1", "reason": "Title excluded"}, {"id": "n2", "reason": "Location not allowed"}, {"id": "n3", "reason": "Fit below threshold"}, {"id": "n4", "reason": "Older than 14 days"}, {"id": "n5", "reason": "Parked by you"}, {"id": "n6", "reason": "Failed mandatory gate"}],
             "leads": [{"dedup_key": "existing co|product manager|chennai", "email_message_id": "<old>", "status": "fit_checked", "job_stream_id": PM_STREAM, "job_board_id": "b-li", "source_platform": "linkedin", "fit_score": 70, "id": "lead-old", "title": "Product Manager", "company": "Existing Co", "location": "Chennai", "url": "https://x/1", "fit_breakdown": {"note": "old"}, "age_days": 3, "easy_apply": True, "created_at": iso(now_utc())}],
             "notifications": [], "applications": [{"id": "app-dry", "title": "Senior PM", "company": "Dry Co", "status": "applied", "url": "https://boards.example/dry"}], "interviews": [],
         }
