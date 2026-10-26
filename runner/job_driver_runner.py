@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Job Application Driver · permanent runner · v1.0.17 · 27 Oct 2026 · v1.0.17: mandatory gates per stream (rubric.gates: location, years asked, product role, or any yes/no question) checked BEFORE weighted fit; a failed gate parks the lead with the reason, a gate the job does not state lets it through with a flag; experience graded by rule from the years the JD asks for; Jev questions ask about the job only (rubric param 'ask', plain levels); gate sweep re-checks and re-scores live leads on the active rubric; career notes synthesised daily from the portfolio (settings.career_notes_auto) plus your Extra notes. v1.0.16 · 25 Oct 2026 · v1.0.16: (a) the nightly digest no longer reports alerts that brought no leads ("No leads 7d" lines are gone), and on a night with nothing to act on (nothing ghosted, stale, overdue or debrief pending; parking old leads alone does not count) no digest is sent at all; (b) every failed or crashed agent run sends a Telegram message: one message per failure streak per agent (not one every pass), a one-line "working again" when it recovers, and failures during quiet hours are reported after quiet hours end. The old "3 failures in a row" and "setup error twice" alerts are folded into this; missed-slot alerts are unchanged. v1.0.15: Jev called DIRECTLY on TypeSafe (POST https://api.typesafe.ai/v1/systemone, model jev-latest, secret TYPESAFE_API_KEY or TYPEFACE_API_KEY or JEV_API_KEY); yes/no questions sent as "noul" and read back into the same shape; Vercel AI Gateway (AI_GATEWAY_API_KEY) only when no direct key is set; Jev cost estimated from tokens. v1.0.14: the JD backlog (filling job descriptions for earlier leads and open applications) is off by default; only new leads get a JD. Switch back on with user_settings.settings.jd_backlog = true. v1.0.13: agent run log. Every agent run writes its agent_runs row when it STARTS (status running) and fills it in at the end with status (success / partial / failed / skipped), error kinds (ai_busy, ai_limit, setup, format, network, gmail, jd_fetch, other), AI calls made, whether the Groq backup was used, and a link to the GitHub run. A row still 'running' after 40 minutes is marked crashed at the start of the next pass. Leads created by the sourcer carry agent_run_id. Telegram alert, at most once a day per agent and never in quiet hours, when an agent fails or crashes 3 runs in a row, hits a setup error twice in a row, or misses its slot (nightly agents after 30 h, every-N-hours agents after 1.5x N + 2 h). v1.0.12: Resume Decider no longer spends a lead's 3 tries on outages (Jev 402/403 no credits, Gemini/Groq 429/503, no model left); it stops for the run, leaves the lead "not yet run" with the reason, and retries next pass. After the first Jev "no credits" reply, Jev is skipped for the rest of the run. v1.0.11: Jev (TypeSafe, via Vercel AI Gateway, secret AI_GATEWAY_API_KEY) as the judge for the new Resume Decider (picklist generic / tailored / not_run / failed on leads; per-stream criteria from the Agents screen; Jev scores each criterion, code applies weights and threshold; Gemini/Groq as backup; low-confidence flag; Failed after 3 tries) and as a shadow fit scorer (leads.fit_shadow, never used for decisions until it passes the eval gate). v1.0.10: fit replies are normalised before the format check (a bare list of scores, a single score object, or scores under "results"/"jobs" are accepted), and a reply that still fails is logged with its first 200 characters. v1.0.9: JD Fetcher (v1.0.8) merged with the agents config. Reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. The JD Fetcher has its own agent row (on/off, max pages per run); JD re-scoring uses the rubric; fit batch defaults to 4. Falls back to built-in behaviour if the agents table cannot be read. v1.0.8: JD Fetcher. Every live lead gets its full job description (LinkedIn public job page, no login; else the company's own apply/careers page via JSON-LD or page text) saved in leads.jd_text before Fit runs, and Fit now scores against the JD (batches of 4). Earlier leads and open applications without a JD are filled in later runs (max 3 tries each, then jd_confidence=fetch_failed). Leads already scored get re-scored once their JD lands. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
+# Job Application Driver · permanent runner · v1.0.18 · 27 Oct 2026 · v1.0.18: "My calls" check: every job you label (fit band or Generic/Tailored) is scored by Gemini and Jev on the active rubric, gates included, into agent_evals.ai_results (6 per pass, never touches leads). v1.0.17 · 27 Oct 2026 · v1.0.17: mandatory gates per stream (rubric.gates: location, years asked, product role, or any yes/no question) checked BEFORE weighted fit; a failed gate parks the lead with the reason, a gate the job does not state lets it through with a flag; experience graded by rule from the years the JD asks for; Jev questions ask about the job only (rubric param 'ask', plain levels); gate sweep re-checks and re-scores live leads on the active rubric; career notes synthesised daily from the portfolio (settings.career_notes_auto) plus your Extra notes. v1.0.16 · 25 Oct 2026 · v1.0.16: (a) the nightly digest no longer reports alerts that brought no leads ("No leads 7d" lines are gone), and on a night with nothing to act on (nothing ghosted, stale, overdue or debrief pending; parking old leads alone does not count) no digest is sent at all; (b) every failed or crashed agent run sends a Telegram message: one message per failure streak per agent (not one every pass), a one-line "working again" when it recovers, and failures during quiet hours are reported after quiet hours end. The old "3 failures in a row" and "setup error twice" alerts are folded into this; missed-slot alerts are unchanged. v1.0.15: Jev called DIRECTLY on TypeSafe (POST https://api.typesafe.ai/v1/systemone, model jev-latest, secret TYPESAFE_API_KEY or TYPEFACE_API_KEY or JEV_API_KEY); yes/no questions sent as "noul" and read back into the same shape; Vercel AI Gateway (AI_GATEWAY_API_KEY) only when no direct key is set; Jev cost estimated from tokens. v1.0.14: the JD backlog (filling job descriptions for earlier leads and open applications) is off by default; only new leads get a JD. Switch back on with user_settings.settings.jd_backlog = true. v1.0.13: agent run log. Every agent run writes its agent_runs row when it STARTS (status running) and fills it in at the end with status (success / partial / failed / skipped), error kinds (ai_busy, ai_limit, setup, format, network, gmail, jd_fetch, other), AI calls made, whether the Groq backup was used, and a link to the GitHub run. A row still 'running' after 40 minutes is marked crashed at the start of the next pass. Leads created by the sourcer carry agent_run_id. Telegram alert, at most once a day per agent and never in quiet hours, when an agent fails or crashes 3 runs in a row, hits a setup error twice in a row, or misses its slot (nightly agents after 30 h, every-N-hours agents after 1.5x N + 2 h). v1.0.12: Resume Decider no longer spends a lead's 3 tries on outages (Jev 402/403 no credits, Gemini/Groq 429/503, no model left); it stops for the run, leaves the lead "not yet run" with the reason, and retries next pass. After the first Jev "no credits" reply, Jev is skipped for the rest of the run. v1.0.11: Jev (TypeSafe, via Vercel AI Gateway, secret AI_GATEWAY_API_KEY) as the judge for the new Resume Decider (picklist generic / tailored / not_run / failed on leads; per-stream criteria from the Agents screen; Jev scores each criterion, code applies weights and threshold; Gemini/Groq as backup; low-confidence flag; Failed after 3 tries) and as a shadow fit scorer (leads.fit_shadow, never used for decisions until it passes the eval gate). v1.0.10: fit replies are normalised before the format check (a bare list of scores, a single score object, or scores under "results"/"jobs" are accepted), and a reply that still fails is logged with its first 200 characters. v1.0.9: JD Fetcher (v1.0.8) merged with the agents config. Reads the Agents screen (public.agents) on every pass: on/off, schedule (every pass / every N hours / nightly), model order and per-agent model names, max items, guardrails (max AI calls, rules-first, min confidence, basis required), the active prompt version, and the per-stream fitment rubric (the AI scores each parameter, this code does the weighted total, if-unknown rule and hard caps); processes eval runs queued in the app (never writes leads); records last run per agent. The JD Fetcher has its own agent row (on/off, max pages per run); JD re-scoring uses the rubric; fit batch defaults to 4. Falls back to built-in behaviour if the agents table cannot be read. v1.0.8: JD Fetcher. Every live lead gets its full job description (LinkedIn public job page, no login; else the company's own apply/careers page via JSON-LD or page text) saved in leads.jd_text before Fit runs, and Fit now scores against the JD (batches of 4). Earlier leads and open applications without a JD are filled in later runs (max 3 tries each, then jd_confidence=fetch_failed). Leads already scored get re-scored once their JD lands. v1.0.7: a missed nightly is caught up only after quiet hours (no digest at 2-3 am). v1.0.6: Groq (free tier, secret GROQ_API_KEY) as automatic backup when Gemini is over its limit or fails; runs every 2 hours (workflow), so nightly work now also catches up after midnight if the 21:36 slot was missed. v1.0.5: after a Gemini 429 the runner pauses Gemini for 60 min (no wasted calls every 15 min); the limit warning waits for the end of quiet hours instead of pinging at night. v1.0.4: retry list (a mail that fails at Gemini or misses the time budget is retried up to 3 runs, never silently lost), LinkedIn alert mails read by fixed rules (Gemini only for unknown formats), daily Gemini call counter + one Telegram warning per day on a 429, nightly work also runs inside any run after 21:36 IST if not yet done today (schedule-proof). v1.0.3: max 25 mails per run, 5-min extraction budget, cursor saved only for processed mails, Gemini timeout 75s and a mail is skipped after one timeout. v1.0.2: Gemini candidates pinged newest-first (30s each), thinking low, working model remembered in user_settings. v1.0.1: model auto-discovery
 # Runs on GitHub Actions (free), no laptop needed. Python 3.11+, standard library only.
 #
 # Modes
@@ -2624,6 +2624,104 @@ def resume_decider(sb, llm, agents, settings, run):
     return n
 
 
+# runner_calls_module_v1.0.py · v1.0 · 27 Oct 2026 · inserted into runner v1.0.18
+# "My calls": every job you label (agent_evals, fit or resume_decider) is scored by Gemini AND Jev on the ACTIVE rubric, gates included.
+# Results go to agent_evals.ai_results; the app compares them with your call. Never writes to leads.
+
+CALLS_PER_PASS = 6
+
+
+def _gemini_resume(llm_r, rub, state, force_unknown):
+    system = RESUME_SYS + "\nScore each parameter 0-100 against its anchors. A higher score means more need to tailor.\n" + render_rubric(rub) + \
+             '\n\nOutput format (fixed by the system): JSON only.\n{"params":{"<parameter key>":{"score":<0-100 or null>,"why":"<under 120 chars>"}},"direct":"generic|tailored"}'
+    out = llm_json_checked(llm_r, system, json.dumps(state), lambda o: isinstance(o, dict) and isinstance(o.get("params"), dict))
+    params = {}
+    for p in rub.get("params") or []:
+        if p.get("enabled") is False:
+            continue
+        v = out["params"].get(p["key"])
+        sc = None if p["key"] in force_unknown else _score(v)
+        params[p["key"]] = {"score": int(round(sc)) if sc is not None else None, "why": str((v or {}).get("why") if isinstance(v, dict) else "")[:160]}
+    return params
+
+
+def calls_check(sb, llm, agents, settings, run, jev=None, limit=CALLS_PER_PASS):
+    fit_a, res_a = agents.get("fit") or {}, agents.get("resume_decider") or {}
+    ids = [x for x in (fit_a.get("id"), res_a.get("id")) if x]
+    if not ids:
+        return 0
+    cases = sb.select("agent_evals", {"owner_id": "eq." + OWNER_ID, "agent_id": "in.(" + ",".join(ids) + ")", "is_active": "eq.true",
+                                      "expected_band": "not.is.null", "select": "id,agent_id,job_stream_id,input,expected_band,ai_results", "order": "created_at.desc", "limit": "400"})
+    if not cases:
+        return 0
+    streams, docs, _, _, _, _ = load_context(sb)
+    full = sb.select("job_streams", {"owner_id": "eq." + OWNER_ID, "select": "id,resume_rubric_version_id"})
+    rmap = {x["id"]: x.get("resume_rubric_version_id") for x in full}
+    for s in streams:
+        s["resume_rubric_version_id"] = rmap.get(s["id"])
+    frubs, rrubs = load_rubrics(sb, streams), load_agent_rubrics(sb, streams, "resume_rubric_version_id")
+    todo = []
+    for c in cases:
+        rv = (frubs if c["agent_id"] == fit_a.get("id") else rrubs).get(c.get("job_stream_id"))
+        if rv and (c.get("ai_results") or {}).get("rubric_version_id") != rv["id"]:
+            todo.append((c, rv))
+    if not todo:
+        return 0
+    llm_f, llm_r = AgentLLM(llm, fit_a), AgentLLM(llm, res_a)
+    notes = career_notes_all(settings)
+    n = 0
+    for c, rv in todo[:limit]:
+        s = next((x for x in streams if x["id"] == c.get("job_stream_id")), None)
+        if not s:
+            continue
+        resume = resume_for(s, docs)
+        lead = dict(c.get("input") or {})
+        rub = rv.get("rubric") or {}
+        thr = float(rub.get("threshold", 60 if c["agent_id"] == fit_a.get("id") else 55))
+        out = {"rubric_version_id": rv["id"], "rubric_version": rv.get("version"), "threshold": thr, "at": iso(now_utc())}
+        if c["agent_id"] == fit_a.get("id"):
+            failed, gates = check_gates(rub, lead, jev)
+            out.update(gates=gates, failed_gate=failed)
+            if failed:
+                out["gemini"] = out["jev"] = {"score": 0, "decision": "park", "why": "failed gate: " + failed}
+            else:
+                try:
+                    res = score_items(llm_f, agents, s, resume, [lead], rv, run, "calls")
+                    sc = res.get(0, (None, None))[0]
+                    out["gemini"] = {"score": sc, "decision": None if sc is None else ("push" if sc >= thr else "park"), "params": (res.get(0, (None, {}))[1] or {}).get("params")}
+                except Exception as e:
+                    out["gemini"] = {"error": str(e)[:160]}
+                if jev and not getattr(jev, "blocked", None):
+                    try:
+                        ans = jev.evaluate(jev_state(lead, s, resume), jev_rubric_questions(rub))
+                        params = jev_param_scores(rub, ans)
+                        sc, caps = apply_rule_params(rub, lead, params)
+                        out["jev"] = {"score": sc, "decision": None if sc is None else ("push" if sc >= thr else "park"), "params": params, "caps": caps}
+                    except Exception as e:
+                        out["jev"] = {"error": str(e)[:160]}
+        else:
+            force_unknown = () if notes.strip() else ("hidden_experience",)
+            state = jev_state(lead, s, resume, notes)
+            try:
+                params = _gemini_resume(llm_r, rub, state, force_unknown)
+                sc, _ = compute_fit(rub, params)
+                out["gemini"] = {"score": sc, "decision": None if sc is None else ("tailored" if sc >= thr else "generic"), "params": params}
+            except Exception as e:
+                out["gemini"] = {"error": str(e)[:160]}
+            if jev and not getattr(jev, "blocked", None):
+                try:
+                    ans = jev.evaluate(state, jev_rubric_questions(rub))
+                    params = jev_param_scores(rub, ans, force_unknown)
+                    sc, _ = compute_fit(rub, params)
+                    out["jev"] = {"score": sc, "decision": None if sc is None else ("tailored" if sc >= thr else "generic"), "params": params}
+                except Exception as e:
+                    out["jev"] = {"error": str(e)[:160]}
+        sb.update("agent_evals", {"id": c["id"]}, {"ai_results": out})
+        n += 1
+    run.notes.append(f"my calls: {n} labelled jobs checked by Gemini and Jev" + (f", {len(todo) - n} left for later" if len(todo) > n else ""))
+    return n
+
+
 def jev_cycle(sb, llm, settings, agents):
     """Resume Decider (if due) then Fit shadow. One agent_runs row each."""
     failures = 0
@@ -2647,6 +2745,13 @@ def jev_cycle(sb, llm, settings, agents):
         except Exception as e:
             r.errors.append({"stage": "fit_shadow", "error": str(e)[:300]})
         r.finish()
+    r = Run(sb, "my_calls", "gemini+jev")
+    try:
+        if calls_check(sb, llm, agents, settings, r, jev=jev if jev and not getattr(jev, "blocked", None) else None) == 0:
+            r.skipped = True
+    except Exception as e:
+        r.errors.append({"stage": "my_calls", "error": str(e)[:300], "trace": traceback.format_exc()[-800:]})
+    r.finish()
     if jev and jev.calls and not sb.dry:
         u = settings.get("jev_usage") or {}
         day = today_ist().isoformat() if hasattr(today_ist(), "isoformat") else str(today_ist())
